@@ -1,0 +1,35 @@
+{
+  "name": "session-improvement-loop",
+  "version": "0.1.0",
+  "description": "Review recent agent sessions and turn recurring friction into validated, reusable improvements.",
+  "author": {
+    "name": "Fakoli",
+    "url": "https://github.com/fakoli"
+  },
+  "homepage": "https://github.com/fakoli/agent-plugins",
+  "repository": "https://github.com/fakoli/agent-plugins",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "sessions",
+    "skills",
+    "productivity"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Session Improvement Loop",
+    "shortDescription": "Build evidence-backed improvements from recent sessions.",
+    "longDescription": "Scans recent agent sessions efficiently, identifies repeated friction, and creates or updates skills and plugins only when evidence supports a reusable improvement.",
+    "developerName": "Fakoli",
+    "category": "Productivity",
+    "capabilities": [
+      "Analysis",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Review yesterday's sessions and build only proven improvements.",
+      "Find repeated agent friction worth turning into a skill.",
+      "Audit recent sessions for token, accuracy, and time savings."
+    ]
+  }
+}
