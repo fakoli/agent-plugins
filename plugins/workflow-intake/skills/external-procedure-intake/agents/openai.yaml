@@ -1,0 +1,4 @@
+interface:
+  display_name: "External Procedure Intake"
+  short_description: "Adapt external runbooks with pinned evidence."
+  default_prompt: "Use $external-procedure-intake to compare this external procedure with the current system and produce a safe test plan."

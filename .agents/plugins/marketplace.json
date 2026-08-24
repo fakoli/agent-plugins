@@ -15,6 +15,42 @@
         "authentication": "ON_INSTALL"
       },
       "category": "Productivity"
+    },
+    {
+      "name": "host-operations",
+      "source": {
+        "source": "local",
+        "path": "./plugins/host-operations"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    },
+    {
+      "name": "workflow-intake",
+      "source": {
+        "source": "local",
+        "path": "./plugins/workflow-intake"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    },
+    {
+      "name": "workspace-coordination",
+      "source": {
+        "source": "local",
+        "path": "./plugins/workspace-coordination"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
     }
   ]
 }

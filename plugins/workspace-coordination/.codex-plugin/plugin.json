@@ -1,0 +1,35 @@
+{
+  "name": "workspace-coordination",
+  "version": "0.1.0",
+  "description": "Coordinate changes across related repositories and worktrees while preserving dirty state and ownership boundaries.",
+  "author": {
+    "name": "Fakoli",
+    "url": "https://github.com/fakoli"
+  },
+  "homepage": "https://github.com/fakoli/agent-plugins",
+  "repository": "https://github.com/fakoli/agent-plugins",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "git",
+    "worktrees",
+    "multi-repository"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Workspace Coordination",
+    "shortDescription": "Coordinate repositories and worktrees safely.",
+    "longDescription": "Maps repository ownership, public and private boundaries, dirty worktrees, cross-repository dependencies, validation, and durable handoff before coordinated changes.",
+    "developerName": "Fakoli",
+    "category": "Productivity",
+    "capabilities": [
+      "Analysis",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Map these related repositories and isolate the requested changes.",
+      "Coordinate this change without disturbing dirty worktrees.",
+      "Classify which repository owns each artifact before editing."
+    ]
+  }
+}

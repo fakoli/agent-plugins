@@ -1,0 +1,4 @@
+interface:
+  display_name: "Multi-Repository Workspace Coordination"
+  short_description: "Coordinate clean changes across related repositories."
+  default_prompt: "Use $multi-repository-workspace-coordination to map repository ownership and isolate these changes safely."
