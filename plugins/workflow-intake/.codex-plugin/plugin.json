@@ -1,0 +1,35 @@
+{
+  "name": "workflow-intake",
+  "version": "0.1.0",
+  "description": "Turn an external gist, README, issue, or runbook into a pinned comparison and safe local test plan.",
+  "author": {
+    "name": "Fakoli",
+    "url": "https://github.com/fakoli"
+  },
+  "homepage": "https://github.com/fakoli/agent-plugins",
+  "repository": "https://github.com/fakoli/agent-plugins",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "runbooks",
+    "research",
+    "reproducibility"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Workflow Intake",
+    "shortDescription": "Adapt external procedures with pinned evidence.",
+    "longDescription": "Pins an external procedure, compares its assumptions with the current system, and produces an exact, adapted, or rejected execution plan with rollback and verification gates.",
+    "developerName": "Fakoli",
+    "category": "Productivity",
+    "capabilities": [
+      "Analysis",
+      "Web"
+    ],
+    "defaultPrompt": [
+      "Compare this gist with what we are running and prepare a safe test.",
+      "Pin this runbook and classify which steps can be reused as written.",
+      "Adapt this external procedure to the current repository conventions."
+    ]
+  }
+}

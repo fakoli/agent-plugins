@@ -1,0 +1,4 @@
+interface:
+  display_name: "Windows GPU Lane Hygiene"
+  short_description: "Diagnose and clear an NVIDIA compute lane safely."
+  default_prompt: "Use $windows-gpu-lane-hygiene to identify what owns this NVIDIA GPU and verify a clean compute lane."

@@ -1,0 +1,36 @@
+{
+  "name": "host-operations",
+  "version": "0.1.0",
+  "description": "Diagnose GPU ownership and credential-loading boundaries without exposing secrets or making unreviewed host changes.",
+  "author": {
+    "name": "Fakoli",
+    "url": "https://github.com/fakoli"
+  },
+  "homepage": "https://github.com/fakoli/agent-plugins",
+  "repository": "https://github.com/fakoli/agent-plugins",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "gpu",
+    "credentials",
+    "windows",
+    "operations"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Host Operations",
+    "shortDescription": "Diagnose GPU and credential ownership safely.",
+    "longDescription": "Provides evidence-first workflows for clearing a Windows NVIDIA compute lane and tracing environment credential sources across shells, WSL, containers, and services.",
+    "developerName": "Fakoli",
+    "category": "Productivity",
+    "capabilities": [
+      "Analysis",
+      "Interactive"
+    ],
+    "defaultPrompt": [
+      "Find what is using this NVIDIA GPU and verify a clean compute lane.",
+      "Trace why this process cannot see its expected environment credential.",
+      "Separate WDDM reservation from an active CUDA allocation."
+    ]
+  }
+}

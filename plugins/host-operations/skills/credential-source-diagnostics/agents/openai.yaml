@@ -1,0 +1,4 @@
+interface:
+  display_name: "Credential Source Diagnostics"
+  short_description: "Trace credential loading without exposing secrets."
+  default_prompt: "Use $credential-source-diagnostics to find why this process is not loading the expected environment credential."
