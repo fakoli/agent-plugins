@@ -1,0 +1,4 @@
+interface:
+  display_name: "Research Synthesis"
+  short_description: "Resolve material decisions with bounded independent research."
+  default_prompt: "Use $research-synthesis to: Research this unresolved decision and synthesize the evidence."

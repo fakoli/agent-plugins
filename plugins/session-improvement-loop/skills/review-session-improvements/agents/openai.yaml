@@ -1,4 +1,4 @@
 interface:
   display_name: "Review Session Improvements"
   short_description: "Turn recent session friction into validated improvements."
-  default_prompt: "Review my recent sessions and build only high-value reusable improvements."
+  default_prompt: "Use $review-session-improvements to review recent sessions and validate high-value reusable improvements."
