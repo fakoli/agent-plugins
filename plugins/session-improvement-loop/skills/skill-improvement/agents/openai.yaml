@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skill Improvement"
+  short_description: "Evaluate one evidence-backed skill improvement at a time."
+  default_prompt: "Use $skill-improvement to: Evaluate this proposed skill improvement with matched controls."

@@ -24,7 +24,8 @@ class PluginCatalogTests(unittest.TestCase):
             self.assertTrue((plugin / "skills").is_dir())
 
     def test_skills_have_complete_frontmatter_and_ui_prompts(self) -> None:
-        plugin_names = {"host-operations", "workflow-intake", "workspace-coordination"}
+        catalog = json.loads(MARKETPLACE.read_text(encoding="utf-8"))
+        plugin_names = {entry["name"] for entry in catalog["plugins"]}
         skills = (
             skill
             for plugin_name in plugin_names

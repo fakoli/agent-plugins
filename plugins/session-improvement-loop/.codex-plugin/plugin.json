@@ -1,7 +1,7 @@
 {
   "name": "session-improvement-loop",
-  "version": "0.1.0",
-  "description": "Review recent agent sessions and turn recurring friction into validated, reusable improvements.",
+  "version": "0.1.0+codex.20260913190724",
+  "description": "Research uncertain decisions and independently validate reusable improvements from task or session evidence.",
   "author": {
     "name": "Fakoli",
     "url": "https://github.com/fakoli"
@@ -18,8 +18,8 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Session Improvement Loop",
-    "shortDescription": "Build evidence-backed improvements from recent sessions.",
-    "longDescription": "Scans recent agent sessions efficiently, identifies repeated friction, and creates or updates skills and plugins only when evidence supports a reusable improvement.",
+    "shortDescription": "Research decisions and validate scoped skill improvements.",
+    "longDescription": "Portable research synthesis, independent skill improvement, and bounded session review. Reuses native agents and project evidence, preserves budget and authority, and loads Astra guidance only when relevant.",
     "developerName": "Fakoli",
     "category": "Productivity",
     "capabilities": [
@@ -27,9 +27,9 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Review yesterday's sessions and build only proven improvements.",
-      "Find repeated agent friction worth turning into a skill.",
-      "Audit recent sessions for token, accuracy, and time savings."
+      "Research this decision using independent evidence and a shared budget.",
+      "Evaluate one evidence-backed improvement to this workflow.",
+      "Review recent sessions for reusable improvements."
     ]
   }
 }

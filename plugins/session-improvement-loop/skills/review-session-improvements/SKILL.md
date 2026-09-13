@@ -11,7 +11,7 @@ Turn recent session evidence into fewer repeated mistakes, smaller prompts, and 
 
 1. Inventory before reading transcripts.
 
-   Run `python scripts/scan_recent_sessions.py inventory --since-hours 24 --output <temporary-json>` from this skill directory. Keep the output outside any repository. Exclude sessions reported as active unless the user explicitly requests them.
+   Run `python3 scripts/scan_recent_sessions.py inventory --since-hours 24 --output <temporary-json>` from this skill directory. On Windows, use the available Python 3 launcher (`py -3` or verified `python`) instead of assuming `python3` exists. Keep the output outside any repository. Exclude sessions reported as active unless the user explicitly requests them.
 
 2. Rank the evidence.
 
@@ -19,7 +19,7 @@ Turn recent session evidence into fewer repeated mistakes, smaller prompts, and 
 
 3. Search for an existing solution.
 
-   Search installed skills, both target plugin repositories, applicable `AGENTS.md` files, and open issues before creating anything. Prefer fixing or extending the narrowest existing artifact. Do not duplicate a capability under a new name.
+   Search installed skills, the authorized destination repositories, applicable `AGENTS.md` files, and open issues before creating anything. Prefer fixing or extending the narrowest existing artifact. Do not duplicate a capability under a new name.
 
 4. Apply the evidence gate.
 
@@ -44,6 +44,14 @@ Turn recent session evidence into fewer repeated mistakes, smaller prompts, and 
    Read [publishing-policy.md](references/publishing-policy.md). Put portable, sanitized work in the public repository and personal or operational workflows in the private repository. Put secrets, raw transcripts, credentials, and capability-bearing endpoints in neither.
 
 7. Author and verify.
+
+   Use [skill-improvement](../skill-improvement/SKILL.md) to freeze the baseline,
+   propose one scoped change, and evaluate it independently before adoption.
+   This session review supplies candidate evidence; it does not prove the
+   proposed instruction works. For a material unresolved research question,
+   use [research-synthesis](../research-synthesis/SKILL.md); routine lookups do
+   not need a panel. Keep session inspection and method evaluation within the
+   same user budget, and retain protected evidence outside this repository.
 
    Use the installed plugin-creator and skill-creator workflows. Keep skills concise and deterministic helpers stdlib-only when practical. Run skill validation, plugin validation, relevant tests, secret scanning when available, and `git diff --check`. Never claim an improvement is proven without recorded validation.
 
