@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "title": "Optional review helper",
+  "date": "2026-09-20",
+  "headline": "Advice beside existing authority",
+  "summary": "Synthetic example showing reusable review elements. No product results are claimed.",
+  "notice": "Offline review artifact. No provider calls, tracking or application controls.",
+  "sections": [
+    {
+      "id": "boundary", "label": "Architecture", "title": "The advice boundary",
+      "blocks": [{
+        "kind": "flow", "id": "architecture", "title": "Advice returns through owner checks",
+        "description": "Selected input passes owner checks and reaches the optional helper. Its answer returns as advice. Acceptance remains separate.",
+        "caption": "Synthetic conceptual diagram.",
+        "paths": [{"title": "Optional advice", "nodes": [
+          {"label": "Selected input", "detail": "Explicit scope"},
+          {"label": "Owner checks", "detail": "Permission and freshness"},
+          {"label": "Optional helper", "detail": "Advisory result"}
+        ], "response": {"label": "Attributed advice", "detail": "Recheck current authority"}}]
+      }]
+    },
+    {
+      "id": "journey", "label": "Journey", "title": "A reviewer remains in control",
+      "blocks": [
+        {"kind": "list", "items": [{"label": "Inspect.", "text": "Read the original evidence."}, {"label": "Decide.", "text": "Use or reject the optional advice."}]},
+        {"kind": "details", "summary": "Failure and recovery", "text": "Unavailable advice preserves the original workflow."},
+        {"kind": "callout", "text": "Hypothesis journey, not customer research."}
+      ]
+    },
+    {
+      "id": "evidence", "label": "Evidence", "title": "Measurements keep their limits",
+      "blocks": [
+        {"kind": "table", "caption": "Synthetic evidence register", "headers": ["Claim", "Evidence", "Limit"], "rows": [["Opt-out works", "Proposed test", "Not run"]]},
+        {"kind": "paragraph", "text": "Replace these examples with sourced observations before review."}
+      ]
+    }
+  ],
+  "footer": "Prepared inputs only. Publication requires a separate request.",
+  "slides": [{
+    "title": "Optional review helper",
+    "notes": "Synthetic example. No implemented product or measured benefit is claimed.",
+    "elements": [
+      {"kind": "row", "heading": "User control", "body": "The existing workflow remains available.", "y": 195},
+      {"kind": "box", "label": "Selected input", "x": 72, "y": 360, "w": 300, "h": 95},
+      {"kind": "arrow", "x": 395, "y": 397, "w": 70},
+      {"kind": "box", "label": "Optional advice", "x": 490, "y": 360, "w": 300, "h": 95},
+      {"kind": "text", "value": "Authority remains with the existing owner.", "x": 72, "y": 540, "w": 1100, "h": 90, "size": 30}
+    ]
+  }]
+}

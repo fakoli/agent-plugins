@@ -1,0 +1,16 @@
+{
+  "name": "feature-retro",
+  "version": "0.2.0",
+  "description": "Prepare evidence-backed retrospective design reviews and article inputs after a feature build.",
+  "author": {"name": "Fakoli"},
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Feature Retro",
+    "shortDescription": "Feature evidence into design reviews and article briefs",
+    "longDescription": "Reconstruct implemented design, user journeys, decisions and test limits. Prepare dated review artifacts beside research notes without drafting or publishing a post.",
+    "developerName": "Fakoli",
+    "category": "Productivity",
+    "capabilities": ["Write"],
+    "defaultPrompt": ["Prepare a retrospective design review of this feature."]
+  }
+}

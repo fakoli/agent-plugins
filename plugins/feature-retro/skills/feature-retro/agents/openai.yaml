@@ -1,0 +1,4 @@
+interface:
+  display_name: "Feature Retro"
+  short_description: "Post-build design reviews and article preparation"
+  default_prompt: "Use $feature-retro to prepare an evidence-backed review of this feature in the selected authoring repository."

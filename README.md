@@ -23,6 +23,7 @@ codex plugin add session-improvement-loop@fakoli-agent-plugins
 | `host-operations` | Diagnose Windows GPU ownership and environment credential loading safely. |
 | `workflow-intake` | Pin and adapt external procedures before executing them locally. |
 | `workspace-coordination` | Coordinate related repositories, worktrees, and ownership boundaries. |
+| `feature-retro` | Prepare retrospective design reviews, user journeys, evidence registers and article briefs after a feature build, without publishing. |
 
 Install any catalog entry with
 `codex plugin add <plugin-name>@fakoli-agent-plugins`.
