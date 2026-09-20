@@ -57,6 +57,22 @@ source and text equivalents. If requested, add a deck or inert storyboard using
 the available artifact skills. Label mockups, synthetic data and future UI
 explicitly. Never render a proposal as a screenshot of a shipped feature.
 
+For repeatable artifacts, use the plugin's JavaScript builder instead of copying
+layout code. Read the plugin-root `README.md` content contract and start with
+`examples/review.json`. Keep feature data in the authoring repository, renderer
+code here. From the plugin root, run
+`node scripts/build-review.mjs <review.json> <new-output-directory>`.
+This emits offline HTML and editable SVG without dependencies. It refuses an
+existing output directory; compare a fresh build before replacing selected
+artifacts with explicit intent. Never edit generated files as the source.
+
+For a requested deck, use the installed presentation skill, resolve its trusted
+runtime to a local untracked config and add `--runtime <runtime.json>`. Inspect
+all final slide renders; schema and package checks cannot prove visual fit.
+The four slide primitives preserve editability, not automatic layout. Do not
+install a runtime or collect machine paths from feature source data. If the
+presentation runtime is unavailable, deliver HTML/SVG and report that limit.
+
 ## Brag-inspired narrative, without a video dependency
 
 Borrow Brag's useful questions: What specific thing changed? Which working user

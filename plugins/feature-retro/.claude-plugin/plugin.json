@@ -1,6 +1,6 @@
 {
   "name": "feature-retro",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Prepare evidence-backed retrospective design reviews and article inputs after a feature build.",
   "author": {"name": "Fakoli"}
 }
