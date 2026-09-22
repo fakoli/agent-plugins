@@ -9,13 +9,25 @@ Turn recent session evidence into fewer repeated mistakes, smaller prompts, and 
 
 ## Workflow
 
-1. Inventory before reading transcripts.
+1. Choose the requested scope before reading transcripts.
+
+   For “reflect on this run” or a current-task review, use current-run mode.
+   Start with this conversation, its retained receipts and failure records. If
+   transcript inspection is needed, run `python3 scripts/scan_recent_sessions.py current --session <exact-session-jsonl>`.
+   This includes an active session as an incomplete live snapshot. Never glob
+   neighboring sessions, infer the newest file, or inject unrelated project
+   handoffs. If the exact session path is unavailable, use the supplied run
+   evidence and report that transcript coverage is unavailable.
+
+   Use the inventory below only for an explicitly requested daily or
+   multi-session audit. Current-run mode follows the remaining steps using only
+   its selected session and workstream.
 
    Run `python3 scripts/scan_recent_sessions.py inventory --since-hours 24 --output <temporary-json>` from this skill directory. On Windows, use the available Python 3 launcher (`py -3` or verified `python`) instead of assuming `python3` exists. Keep the output outside any repository. Exclude sessions reported as active unless the user explicitly requests them.
 
 2. Rank the evidence.
 
-   Start with completed sessions that have tool failures, human-correction signals, repeated tool sequences, or high output-token cost. Inspect at most three sessions initially. Use `slice --session <path> --line <n>` to read small windows around signal lines; widen only when the cause is still unclear.
+   For multi-session mode, start with completed sessions that have tool failures, human-correction signals, repeated tool sequences, or high output-token cost. Inspect at most three sessions initially. Use `slice --session <path> --line <n>` to read small windows around signal lines; widen only when the cause is still unclear.
 
 3. Search for an existing solution.
 

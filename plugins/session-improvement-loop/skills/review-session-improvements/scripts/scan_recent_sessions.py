@@ -270,6 +270,23 @@ def session_files(roots: Iterable[Path], cutoff: dt.datetime) -> Iterable[Path]:
                 yield path
 
 
+def current_command(args: argparse.Namespace) -> int:
+    """Inspect one explicit session; never discover neighboring sessions."""
+    path = Path(args.session).expanduser().resolve()
+    if not path.is_file():
+        raise SystemExit(f"session file not found: {path}")
+    item = scan_session(path)
+    write_json({
+        "schema_version": SCHEMA_VERSION,
+        "scope": "current-session",
+        "generated_at": iso_utc(utc_now()),
+        "live_snapshot": item["status"] == "active",
+        "session_count": 1,
+        "sessions": [item],
+    }, args.output)
+    return 0
+
+
 def inventory_command(args: argparse.Namespace) -> int:
     generated_at = utc_now()
     cutoff = generated_at - dt.timedelta(hours=args.since_hours)
@@ -381,6 +398,11 @@ def slice_command(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    current = subparsers.add_parser("current", help="inspect only an explicitly selected session, including an active one")
+    current.add_argument("--session", required=True)
+    current.add_argument("--output")
+    current.set_defaults(func=current_command)
 
     inventory = subparsers.add_parser("inventory", help="rank recent sessions using metadata and signal counts")
     inventory.add_argument("--root", action="append", help="session root; repeat for multiple roots")
