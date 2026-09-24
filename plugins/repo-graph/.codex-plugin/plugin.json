@@ -1,6 +1,6 @@
 {
   "name": "repo-graph",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Map local or public git repositories with offline interactive architecture diagrams and optional Jev roles.",
   "author": {
     "name": "Fakoli"
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Repo Graph",
     "shortDescription": "Local repository graphs and architecture diagrams",
-    "longDescription": "Build a clean-room, offline repository diagram with paged directory drilldown, local import links, a compact Mermaid overview, and optional Jev role labels. Large inputs stay on disk and use no model tokens by default.",
+    "longDescription": "Explore repository system architecture, card/tree/radial diagrams, a file-count treemap, data tables, and a dependency matrix. Offline views share bounded drilldown, sorting, filtering, CSV and SVG export, and optional Jev role labels.",
     "developerName": "Fakoli",
     "category": "Productivity",
     "capabilities": ["Write"],

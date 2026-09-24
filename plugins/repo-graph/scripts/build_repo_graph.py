@@ -235,11 +235,82 @@ def typesafe_key() -> str:
     return ""
 
 
+def system_view(tree: dict[str, dict], dependencies: list[dict], roles: dict[str, str]) -> dict:
+    """A disjoint, bounded partition of repository files into inspectable components."""
+    groups = []
+    categories = {
+        "docs": ("Documentation", "documentation"), "website": ("Documentation", "documentation"),
+        "examples": ("Examples", "examples"), "tests": ("Tests", "tests"), "test": ("Tests", "tests"),
+        "tools": ("Developer tools", "tooling"), "scripts": ("Developer tools", "tooling"),
+        "generate": ("Developer tools", "tooling"), "generator": ("Developer tools", "tooling"),
+        "acctest": ("Tests", "tests"),
+        "infrastructure": ("Infrastructure", "infrastructure"), "deploy": ("Infrastructure", "infrastructure"),
+    }
+    layers = {"runtime": 1, "application": 1, "library": 1, "tooling": 2, "infrastructure": 2, "tests": 2,
+              "documentation": 3, "examples": 3, "other": 2}
+    def add(name: str, paths: list[str], count: int, role: str, summary: str) -> None:
+        if count:
+            existing = next((group for group in groups if group["name"] == name and group["role"] == role), None)
+            if existing:
+                existing["paths"].extend(paths)
+                existing["count"] += count
+                return
+            groups.append({"name": name, "paths": paths, "count": count, "role": role,
+                           "layer": layers.get(role, 2), "summary": summary})
+    add("Root files", [""], len(tree[""]["direct"]), "entry", "Top-level source and configuration")
+    for path in tree[""]["children"]:
+        branch = tree[path]
+        if path.lower() in {"src", "app", "apps", "packages", "internal", "pkg", "lib", "services", "server", "client"} and branch["children"]:
+            priority = {"provider": 0, "api": 0, "core": 0, "service": 1, "services": 1,
+                        "framework": 2, "conns": 3, "server": 3, "client": 3, "storage": 3}
+            children = []
+            for child in branch["children"]:
+                category = categories.get(posixpath.basename(child).lower())
+                if category:
+                    add(category[0], [child], tree[child]["count"], category[1], f"{category[0]} source directories")
+                else:
+                    children.append(child)
+            children.sort(key=lambda child: (priority.get(posixpath.basename(child).lower(), 4), -tree[child]["count"], child))
+            for child in children[:4]:
+                add(child, [child], tree[child]["count"], "runtime", f"Code and assets under {child}")
+            remaining = children[4:]
+            add(f"Shared {path} components", remaining + ([path] if branch["direct"] else []),
+                sum(tree[child]["count"] for child in remaining) + len(branch["direct"]),
+                "runtime", "Additional packages in this source area")
+        else:
+            name, role = categories.get(path.lower(), (path, roles.get(path, "other")))
+            add(name, [path], branch["count"], role, f"{name} source directories" if path.lower() in categories else f"Source area: {path}")
+    if len(groups) > 12:
+        ranked = sorted(groups, key=lambda group: (group["role"] not in {"entry", "runtime", "application"}, -group["count"], group["name"]))
+        kept, remainder = ranked[:11], ranked[11:]
+        groups = kept + [{"name": "Other components", "paths": [path for group in remainder for path in group["paths"]],
+                         "count": sum(group["count"] for group in remainder), "role": "other", "layer": 2,
+                         "summary": "Additional source areas; inspect to explore"}]
+    groups.sort(key=lambda group: (0 if group["role"] == "entry" else group["layer"], group["name"]))
+    explicit = {}
+    for index, group in enumerate(groups):
+        group.update(id=f"system:{index}", kind="system", layer=0 if group["role"] == "entry" else group["layer"])
+        group["files"] = [file for path in group["paths"] for file in tree[path]["direct"][:2]][:8]
+        for path in group["paths"]:
+            explicit[path] = group["id"]
+    owners = {}
+    for path in sorted(tree, key=lambda path: (path.count("/") + bool(path), path)):
+        owners[path] = explicit.get(path, owners.get(posixpath.dirname(path)))
+    edges = Counter()
+    for edge in dependencies:
+        a, b = owners.get(edge["source"]), owners.get(edge["target"])
+        if a and b and a != b:
+            edges[a, b] += edge["count"]
+    return {"nodes": groups, "edges": [{"source": a, "target": b, "count": n, "relation": "imports"}
+                                      for (a, b), n in sorted(edges.items(), key=lambda item: (-item[1], item[0]))]}
+
+
 def write_page(path: Path, data: dict) -> None:
     template = Path(__file__).resolve().parents[1] / "assets" / "diagram.html"
     payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     payload = payload.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
-    path.write_text(template.read_text(encoding="utf-8").replace("__REPO_GRAPH_DATA__", payload), encoding="utf-8")
+    html = template.read_text(encoding="utf-8").replace("__VIEW_HELPERS__", template.with_name("views.js").read_text(encoding="utf-8"))
+    path.write_text(html.replace("__REPO_GRAPH_DATA__", payload), encoding="utf-8")
 
 
 def source_root(value: str, cache: Path, refresh: bool = False) -> Path:
@@ -329,10 +400,11 @@ def main() -> int:
     edges = scope_edges(dependencies)
     graph = {"schema": 1, "name": root.name, "file_count": len(files), "files": files,
              "tree": tree, "dependencies": dependencies, "scope_edges": edges,
-             "scan": scan, "jev": jev_status, "roles": roles}
+             "scan": scan, "jev": jev_status, "roles": roles,
+             "system": system_view(tree, dependencies, roles)}
     graph_path = output / "graph.json"
     graph_path.write_text(json.dumps(graph, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-    view = {key: graph[key] for key in ("name", "file_count", "tree", "scope_edges", "scan", "jev", "roles")}
+    view = {key: graph[key] for key in ("name", "file_count", "tree", "scope_edges", "scan", "jev", "roles", "system")}
     for name in ("architecture.html", "graph.html"):
         write_page(output / name, view)
     diagram = mermaid(tree, edges)

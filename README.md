@@ -33,6 +33,10 @@ Install any catalog entry with
 writes a self-contained interactive view, Mermaid source, and JSON under the
 user's cache. The clean-room scanner batches files, caches bounded import
 extraction, and pages large directory maps. It makes no model calls by default.
+The viewer includes a System tab, card/tree/radial diagrams, a file-count
+treemap, a sortable data table, and a directed dependency matrix. Each view
+shares directory drilldown and filters; export the diagram as SVG or the
+filtered directory data as CSV.
 Use `--jev` to opt into one speculative TypeSafe System One request for
 confident component role labels; this sends top-level directory names only.
 

@@ -58,6 +58,24 @@ class RepoGraphTests(unittest.TestCase):
             html = page.read_text(encoding="utf-8")
         self.assertNotIn("</script><script>alert(1)", html)
         self.assertIn("u003c/script", html)
+        self.assertNotIn("__VIEW_HELPERS__", html)
+
+    def test_system_partition_preserves_files_and_imports(self) -> None:
+        files = ["main.go", "internal/core.go", "internal/provider/provider.go", "docs/guide.md", "website/index.md"]
+        files += [f"internal/service{i}/resource.go" for i in range(30)]
+        files += [f"area{i}/data.txt" for i in range(20)]
+        tree = repo_graph.tree_index(files)
+        system = repo_graph.system_view(tree, [
+            {"source": "", "target": "internal/service0", "count": 3},
+            {"source": "internal/service0", "target": "internal/service29", "count": 2},
+        ], {})
+        self.assertLessEqual(len(system["nodes"]), 12)
+        self.assertEqual(sum(node["count"] for node in system["nodes"]), len(files))
+        paths = [path for node in system["nodes"] for path in node["paths"]]
+        self.assertEqual(len(paths), len(set(paths)))
+        self.assertEqual(sum(edge["count"] for edge in system["edges"]), 5)
+        self.assertTrue(all(node["paths"] for node in system["nodes"]))
+        self.assertTrue(any(node["paths"] == ["internal/provider"] for node in system["nodes"]))
 
     def test_jev_uses_one_bounded_typed_request_and_confidence_gate(self) -> None:
         class Response(BytesIO):
