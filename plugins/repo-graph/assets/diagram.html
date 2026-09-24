@@ -25,6 +25,7 @@
   .top-link:hover,.top-button:hover { background:#f2f5ff; border-color:#b7c5f6; transform:translateY(-1px); }
   .top-button.primary { background:#273469; border-color:#273469; color:#fff; box-shadow:3px 3px 0 #b8c2ff; }
   .top-button.primary:hover { background:#3648a2; }
+  .top-button:disabled { opacity:.4; cursor:default; }
   .inspector-toggle,.inspector-close { display:none; }
   .workspace { min-height:0; display:grid; grid-template-columns:268px minmax(0,1fr) 298px; }
   .sidebar,.inspector { background:#fff; overflow:auto; }
@@ -33,6 +34,25 @@
   .eyebrow { color:#6c77a0; font:700 10px/1.2 "SFMono-Regular",Consolas,monospace; letter-spacing:.16em; text-transform:uppercase; }
   .side-title { font:600 27px/1.05 Georgia,"Iowan Old Style",serif; letter-spacing:-.035em; margin:9px 0 10px; }
   .side-copy { color:var(--muted); font-size:12px; line-height:1.65; margin:0 0 24px; }
+  .view-options { display:grid; gap:9px; margin-bottom:20px; }
+  .view-options label { display:grid; grid-template-columns:42px minmax(0,1fr); gap:6px; align-items:center; color:var(--muted); font-size:11px; }
+  .view-options select { width:100%; min-height:33px; border:1px solid var(--line); border-radius:8px; background:#f8f9fc; padding:5px 8px; color:var(--ink); font:inherit; }
+  .view-tabs { display:flex; gap:5px; margin-bottom:15px; }
+  .view-tabs button { flex:1; border:1px solid var(--line); border-radius:8px; padding:8px 4px; background:#fff; color:#53607a; font:700 11px "Segoe UI",sans-serif; }
+  .view-tabs button[aria-selected="true"] { background:#273469; border-color:#273469; color:#fff; }
+  .data-panel { position:absolute; inset:160px 24px 65px; overflow:auto; background:#ffffffee; border:1px solid var(--line); border-radius:12px; }
+  .data-panel[hidden] { display:none; }
+  .data-panel table { border-collapse:collapse; width:100%; font-size:12px; }
+  .data-panel th,.data-panel td { padding:12px; text-align:left; border-bottom:1px solid #e8ecf3; white-space:nowrap; }
+  .data-panel th { position:sticky; top:0; background:#eff2fb; color:#485577; z-index:1; font-size:11px; }
+  .data-panel tbody th { position:static; background:transparent; font-weight:normal; }
+  .data-panel .matrix tbody th { position:sticky; left:0; background:#f5f7fc; }
+  .data-panel button { border:0; background:transparent; color:#354bab; text-align:left; cursor:pointer; font:inherit; }
+  .data-row:hover,.data-row.active { background:#eef1ff; }
+  .data-panel .matrix th,.data-panel .matrix td { padding:5px; min-width:38px; text-align:center; }
+  .data-panel .matrix th:first-child { text-align:left; }
+  .data-panel .matrix td button { width:100%; min-height:29px; text-align:center; color:#243467; border-radius:5px; }
+  .matrix-key { padding:12px 16px; color:var(--muted); font-size:11px; }
   .stat-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:7px; margin-bottom:26px; }
   .stat { border:1px solid var(--line); border-radius:10px; padding:9px 7px 8px; background:#fbfcff; text-align:center; }
   .stat strong { display:block; font:700 19px/1 Georgia,serif; letter-spacing:-.04em; }
@@ -127,6 +147,7 @@
       <a class="top-link" id="view-link" href="graph.html">Dependency graph ↗</a>
       <a class="top-link" href="graph.json" download>Graph JSON ↓</a>
       <a class="top-link" href="architecture.mmd" download>Mermaid ↓</a>
+      <button class="top-button" id="export-csv" type="button" title="Export all filtered entries in this directory">Scope CSV ↓</button>
       <button class="top-button inspector-toggle" id="inspector-toggle" type="button" aria-controls="inspector" aria-expanded="false">Details</button>
       <button class="top-button primary" id="export-svg" type="button">Export SVG ↓</button>
     </nav>
@@ -136,6 +157,12 @@
       <div class="eyebrow">01 / Overview</div>
       <h2 class="side-title">The shape<br>of the repo.</h2>
       <p class="side-copy">A grounded map of files and relationships. Select a component to follow its connections.</p>
+      <div class="view-tabs" role="tablist" aria-label="Repository views"><button type="button" role="tab" id="tab-system" aria-selected="false">System</button><button type="button" role="tab" id="tab-explore" aria-selected="true">Explore</button><button type="button" role="tab" id="tab-data" aria-selected="false">Data</button></div>
+      <div class="view-options">
+        <label>View<select id="view-mode"><option value="system">System overview</option><option value="atlas" selected>Card diagram</option><option value="tree">Top-down tree</option><option value="radial">Radial map</option><option value="treemap">File-count treemap</option><option value="table">Data table</option><option value="matrix">Dependency matrix</option></select></label>
+        <label>Sort<select id="sort-mode"><option value="name">Name</option><option value="files">Most files</option><option value="imports">Most imports</option></select></label>
+        <label>Show<select id="kind-filter"><option value="all">Directories and files</option><option value="directory">Directories</option><option value="file">Files</option></select></label>
+      </div>
       <div class="stat-grid"><div class="stat"><strong id="stat-components">0</strong><span>Parts</span></div><div class="stat"><strong id="stat-links">0</strong><span>Links</span></div><div class="stat"><strong id="stat-files">0</strong><span>Files</span></div></div>
       <div class="navigation"><button id="up" type="button" aria-label="Go up one directory">↑ Up</button><span id="breadcrumb"></span></div>
       <div class="section-line"><h2>Components</h2><span id="list-count"></span></div>
@@ -147,6 +174,7 @@
     <main class="stage">
       <div class="stage-heading"><div class="eyebrow">02 / Architecture map</div><h1 id="map-title">Architecture map</h1><p id="map-subtitle"></p><div class="legend"><span><i class="contains"></i>Contains</span><span><i class="imports"></i>Imports</span></div></div>
       <svg id="map" role="group" aria-label="Interactive repository architecture diagram"><defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M 0 0 L 8 4 L 0 8 z" fill="#6375dc"/></marker></defs><g id="world"></g></svg>
+      <div class="data-panel" id="data-panel" hidden></div>
       <div class="stage-hint">DRAG TO PAN · SCROLL TO ZOOM · DOUBLE CLICK TO EXPLORE</div>
       <div class="controls" aria-label="Canvas controls"><button id="zoom-out" type="button" aria-label="Zoom out">−</button><span class="zoom-value" id="zoom-value">100%</span><button id="zoom-in" type="button" aria-label="Zoom in">+</button><button id="fit" class="fit" type="button">Fit view</button></div>
     </main>
@@ -155,6 +183,7 @@
 </div>
 <script type="application/json" id="graph-data">__REPO_GRAPH_DATA__</script>
 <script>
+__VIEW_HELPERS__
 (() => {
   'use strict';
   const data = JSON.parse(document.getElementById('graph-data').textContent);
@@ -162,7 +191,8 @@
   const viewLink = document.getElementById('view-link');
   viewLink.href = graphMode ? 'architecture.html' : 'graph.html';
   viewLink.textContent = graphMode ? 'Architecture diagram ↗' : 'Dependency graph ↗';
-  let parts = [], links = [], scopeEntries = [], byId = new Map(), scopePath = '', page = 0;
+  let parts = [], links = [], scopeEntries = [], counts = new Map(), byId = new Map(), scopePath = '', page = 0;
+  let viewMode = 'atlas', sortMode = 'name', kindFilter = 'all';
   const colors = ['#5067e9','#13a594','#e8a342','#d46b83','#8a70cc','#3b97ba'];
   const soft = ['#e9edff','#dff8f2','#fff1d8','#ffe8ed','#f0eaff','#e3f3fa'];
   const roleColors = {application:'#5067e9',library:'#13a594',infrastructure:'#8a70cc',tests:'#d46b83',documentation:'#3b97ba',examples:'#e8a342',tooling:'#6d7d95'};
@@ -181,10 +211,15 @@
   document.getElementById('stat-files').textContent = data.file_count.toLocaleString();
 
   function renderScope() {
+    for (const [id,active] of [['tab-system',viewMode === 'system'],['tab-data',['table','matrix'].includes(viewMode)],['tab-explore',['atlas','tree','radial','treemap'].includes(viewMode)]]) document.getElementById(id).setAttribute('aria-selected',String(active));
+    document.getElementById('sort-mode').disabled = viewMode === 'system';
+    document.getElementById('kind-filter').disabled = viewMode === 'system';
+    if (viewMode === 'system') { renderSystem(); return; }
     const branch = data.tree[scopePath];
     const directories = branch.children.map(path => ({id:path,name:path,count:data.tree[path].count,files:data.tree[path].sample,kind:'directory',role:data.roles[path]}));
     const files = branch.direct.map(path => ({id:'file:' + path,name:path,count:1,files:[path],kind:'file'}));
-    const entries = [...directories,...files].filter(node => node.name.split('/').pop().toLowerCase().includes(query));
+    counts = RepoViews.metrics(data.scope_edges[scopePath] || []);
+    const entries = RepoViews.ordered([...directories,...files].filter(node => (kindFilter === 'all' || node.kind === kindFilter) && node.name.split('/').pop().toLowerCase().includes(query)),sortMode,counts);
     scopeEntries = entries;
     const pageSize = graphMode ? 24 : 23;
     const pageCount = Math.max(1,Math.ceil(entries.length / pageSize));
@@ -205,25 +240,36 @@
     document.getElementById('previous').disabled = page === 0;
     document.getElementById('next').disabled = page >= pageCount - 1;
     document.getElementById('page-label').textContent = `Page ${page + 1} / ${pageCount}`;
-    document.getElementById('map-subtitle').textContent = `${entries.length} components · ${imports.length} visible import relationships`;
+    document.getElementById('map-subtitle').textContent = viewMode === 'treemap' ? 'Area represents file count on this page · double click to explore' : `${entries.length} components · ${imports.length} visible import relationships`;
     document.getElementById('stat-components').textContent = entries.length.toLocaleString();
     document.getElementById('stat-links').textContent = links.length;
     layout();
     document.getElementById('map-title').textContent = scopePath ? title(scopePath) : graphMode ? 'Dependency graph' : 'Architecture map';
-    draw(); renderList(); renderInspector();
-    requestAnimationFrame(() => { fit(); if (scale < .65) { scale = .75; tx = 28; ty = 118; transform(); } });
+    const isData = viewMode === 'table' || viewMode === 'matrix';
+    svg.style.display = isData ? 'none' : 'block';
+    document.getElementById('data-panel').hidden = !isData;
+    document.querySelector('.controls').style.display = isData ? 'none' : 'flex';
+    document.querySelector('.stage-hint').style.display = isData ? 'none' : '';
+    document.querySelector('.legend').style.display = isData || viewMode === 'treemap' ? 'none' : 'flex';
+    document.querySelector('.legend span').style.display = '';
+    document.getElementById('export-svg').disabled = isData;
+    if (isData) renderData(); else if (viewMode === 'treemap') drawTreemap(); else draw();
+    renderList(); renderInspector();
+    if (!isData) requestAnimationFrame(() => { fit(); if (scale < .65) { scale = .75; tx = 28; ty = 118; transform(); } });
   }
 
   function enter(path) {
     if (!data.tree[path]) return;
+    if (viewMode === 'system') { viewMode = 'atlas'; kindFilter = 'all'; document.getElementById('kind-filter').value = 'all'; document.getElementById('view-mode').value = viewMode; }
     scopePath = path; page = 0; query = '';
     document.getElementById('search').value = '';
     renderScope();
   }
   function focusPath(id) {
+    if (viewMode === 'system') { if (!byId.has(id)) { query = ''; document.getElementById('search').value = ''; renderScope(); } select(id,true); return; }
     if (id.startsWith('scope:')) { if (!graphMode) select(id,true); return; }
     if (!scopeEntries.some(node => node.id === id)) {
-      query = ''; document.getElementById('search').value = '';
+      query = ''; kindFilter = 'all'; document.getElementById('search').value = ''; document.getElementById('kind-filter').value = 'all';
       renderScope();
     }
     const index = scopeEntries.findIndex(node => node.id === id);
@@ -234,20 +280,99 @@
   }
 
   function layout() {
-    const columns = [];
-    const root = parts.filter(n => n.kind === 'repository');
-    if (root.length) columns.push(root);
-    const rest = parts.filter(n => n.kind !== 'repository');
-    for (let i = 0; i < rest.length; i += 6) columns.push(rest.slice(i,i + 6));
-    if (!columns.length) columns.push([]);
-    const maxRows = Math.max(...columns.map(column => column.length),1);
-    const row = H + 52, col = W + 164;
-    positions = new Map();
-    columns.forEach((column,ci) => column.forEach((node,ri) => positions.set(node.id,{x:80 + ci * col,y:110 + (maxRows - column.length) * row / 2 + ri * row})));
-    bounds = {width:160 + (columns.length - 1) * col + W,height:220 + maxRows * row};
+    const result = RepoViews.layout(parts,viewMode,links);
+    positions = result.boxes; bounds = {width:result.width,height:result.height};
+  }
+
+  function renderSystem() {
+    scopePath = ''; page = 0;
+    parts = (data.system?.nodes || []).filter(node => (node.name + ' ' + node.summary).toLowerCase().includes(query));
+    scopeEntries = parts;
+    byId = new Map(parts.map((node,index) => [node.id,{...node,index}]));
+    const visible = new Set(parts.map(node => node.id));
+    links = (data.system?.edges || []).filter(edge => visible.has(edge.source) && visible.has(edge.target)).slice(0,40);
+    counts = RepoViews.metrics(data.system?.edges || []);
+    selected = null;
+    document.getElementById('breadcrumb').textContent = data.name;
+    for (const id of ['up','previous','next']) document.getElementById(id).disabled = true;
+    document.getElementById('page-label').textContent = 'Whole repository';
+    document.getElementById('scope').textContent = 'System overview';
+    document.getElementById('map-title').textContent = 'System architecture';
+    document.getElementById('map-subtitle').textContent = `${parts.length} source areas · observed imports · roles inferred from directory structure`;
+    document.getElementById('stat-components').textContent = parts.length;
+    document.getElementById('stat-links').textContent = links.length;
+    svg.style.display = 'block'; document.getElementById('data-panel').hidden = true;
+    document.querySelector('.controls').style.display = 'flex';
+    document.querySelector('.stage-hint').style.display = '';
+    document.querySelector('.legend').style.display = 'flex';
+    document.querySelector('.legend span').style.display = 'none';
+    document.getElementById('export-svg').disabled = false;
+    layout(); draw(); renderList(); renderInspector(); requestAnimationFrame(fit);
+  }
+
+  function drawTreemap() {
+    world.replaceChildren();
+    for (const node of parts.filter(node => node.kind !== 'repository')) {
+      const box = positions.get(node.id);
+      const g = make('g',{class:'node',transform:`translate(${box.x} ${box.y})`,tabindex:0,role:'button','data-id':node.id,'aria-label':`${node.name}, ${node.count} files`},world);
+      const titleElement = make('title',{},g); titleElement.textContent = `${node.name}: ${node.count} files`;
+      make('rect',{width:Math.max(0,box.width-3),height:Math.max(0,box.height-3),rx:5,fill:color(node.id),'fill-opacity':.18,stroke:color(node.id)},g);
+      if (box.width > 65 && box.height > 35) {
+        const name = make('text',{x:10,y:23,class:'node-title'},g); name.textContent = short(title(node.name),Math.max(3,Math.floor((box.width-20)/10)));
+        if (box.height > 60) { const count = make('text',{x:10,y:45,class:'node-count'},g); count.textContent = `${node.count.toLocaleString()} FILES`; }
+      }
+      g.addEventListener('click',() => select(node.id));
+      if (node.kind === 'directory') g.addEventListener('dblclick',() => enter(node.id));
+      g.addEventListener('keydown',event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); if (event.key === 'Enter' && node.kind === 'directory') enter(node.id); else select(node.id); } });
+    }
+    refresh();
+  }
+
+  function renderData() {
+    const host = document.getElementById('data-panel'); host.replaceChildren();
+    const nodes = parts.filter(node => node.kind !== 'repository');
+    const table = document.createElement('table');
+    const caption = document.createElement('caption'); caption.className = 'matrix-key';
+    caption.textContent = viewMode === 'matrix' ? 'Rows import columns. Column numbers match row numbers; blank cells have no observed imports.' : 'Import totals include connections to other pages in this directory. CSV exports every filtered entry.';
+    document.getElementById('map-subtitle').textContent = viewMode === 'matrix' ? `${nodes.length} components on this page · directed import counts` : `${scopeEntries.length} filtered entries · CSV includes all pages`;
+    table.appendChild(caption);
+    const head = document.createElement('thead'), header = document.createElement('tr');
+    const columns = viewMode === 'matrix' ? ['Imports →',...nodes.map((node,index) => String(index+1))] : ['Component','Type','Files','Incoming imports','Outgoing imports','Role','Explore'];
+    columns.forEach((label,index) => { const th = document.createElement('th'); th.scope = 'col'; th.textContent = label; if (viewMode === 'matrix' && index) th.title = nodes[index-1].name; header.appendChild(th); });
+    head.appendChild(header); table.appendChild(head);
+    const body = document.createElement('tbody');
+    const weights = new Map((data.scope_edges[scopePath] || []).map(edge => [JSON.stringify([edge.source,edge.target]),edge.count]));
+    let maxWeight = 1; for (const weight of weights.values()) maxWeight = Math.max(maxWeight,weight);
+    if (viewMode === 'matrix') table.className = 'matrix';
+    nodes.forEach((node,index) => {
+      const row = document.createElement('tr'); row.className = 'data-row'; row.dataset.id = node.id;
+      const nameCell = document.createElement('th'); nameCell.scope = 'row';
+      const name = document.createElement('button'); name.type = 'button'; name.textContent = (viewMode === 'matrix' ? `${index+1}. ` : '') + node.name.split('/').pop(); name.title = node.name; name.addEventListener('click',() => select(node.id)); nameCell.appendChild(name); row.appendChild(nameCell);
+      if (viewMode === 'matrix') {
+        for (const target of nodes) {
+          const cell = document.createElement('td'), weight = weights.get(JSON.stringify([node.id,target.id])) || 0;
+          if (weight) {
+            const button = document.createElement('button'); button.type = 'button'; button.textContent = weight; button.title = `${node.name} imports ${target.name}: ${weight}`;
+            button.style.background = `rgba(76,99,232,${.12+.55*Math.log1p(weight)/Math.log1p(maxWeight)})`;
+            button.addEventListener('click',() => select(node.id)); cell.appendChild(button);
+          } else cell.textContent = '·';
+          row.appendChild(cell);
+        }
+      } else {
+        const metric = counts.get(node.id) || {incoming:0,outgoing:0};
+        for (const value of [node.kind,node.count,metric.incoming,metric.outgoing,node.role || '—']) { const td = document.createElement('td'); td.textContent = value; row.appendChild(td); }
+        const td = document.createElement('td');
+        if (node.kind === 'directory') { const open = document.createElement('button'); open.type = 'button'; open.textContent = 'Open →'; open.addEventListener('click',() => enter(node.id)); td.appendChild(open); }
+        row.appendChild(td);
+      }
+      body.appendChild(row);
+    });
+    table.appendChild(body); host.appendChild(table);
+    if (!nodes.length) { const empty = document.createElement('p'); empty.className = 'matrix-key'; empty.textContent = 'No matching components in this directory.'; host.appendChild(empty); }
   }
 
   function path(a,b) {
+    if (viewMode === 'tree') return `M ${a.x+W/2} ${a.y+H} C ${a.x+W/2} ${a.y+H+65}, ${b.x+W/2} ${b.y-65}, ${b.x+W/2} ${b.y}`;
     const sx = a.x + W, sy = a.y + H/2, ex = b.x, ey = b.y + H/2;
     const bend = Math.max(75,Math.abs(ex - sx) * .42);
     return `M ${sx} ${sy} C ${sx + bend} ${sy}, ${ex - bend} ${ey}, ${ex} ${ey}`;
@@ -279,7 +404,7 @@
       make('rect',{x:17,y:20,width:31,height:31,rx:9,fill:soft[i % soft.length]},g);
       const index = make('text',{x:32.5,y:40,'text-anchor':'middle',class:'node-index',fill:color(node.id)},g); index.textContent = String(i + 1).padStart(2,'0');
       const name = make('text',{x:59,y:39,class:'node-title'},g); name.textContent = short(title(node.name),19);
-      const pathText = make('text',{x:18,y:73,class:'node-path'},g); pathText.textContent = short(node.name,31);
+      const pathText = make('text',{x:18,y:73,class:'node-path'},g); pathText.textContent = short(node.summary || node.name,31);
       const count = make('text',{x:18,y:94,class:'node-count'},g); count.textContent = `${node.role ? node.role.toUpperCase() + ' · ' : ''}${node.count} ${node.count === 1 ? 'FILE' : 'FILES'}`;
       g.addEventListener('click',() => select(node.id));
       if (node.kind === 'directory') g.addEventListener('dblclick',() => enter(node.id));
@@ -288,14 +413,15 @@
     refresh();
   }
   function transform() { world.setAttribute('transform',`translate(${tx} ${ty}) scale(${scale})`); document.getElementById('zoom-value').textContent = `${Math.round(scale * 100)}%`; }
-  function fit() { const w = svg.clientWidth, h = svg.clientHeight; scale = Math.min(1.3,(w - 100) / bounds.width,(h - 130) / bounds.height); scale = Math.max(.15,scale); tx = (w - bounds.width * scale) / 2; ty = (h - bounds.height * scale) / 2; transform(); }
+  function fit() { if (svg.style.display === 'none') return; const w = svg.clientWidth, h = svg.clientHeight; scale = Math.min(1.3,(w - 100) / bounds.width,(h - 130) / bounds.height); scale = Math.max(.15,scale); tx = (w - bounds.width * scale) / 2; ty = (h - bounds.height * scale) / 2; transform(); }
   function zoom(factor,x = svg.clientWidth/2,y = svg.clientHeight/2) { const next = Math.min(2.6,Math.max(.18,scale * factor)); tx = x - (x - tx) * next / scale; ty = y - (y - ty) * next / scale; scale = next; transform(); }
-  function select(id, center = false) { selected = id; refresh(); renderInspector(); if (center) { const p = positions.get(id); tx = svg.clientWidth/2 - (p.x + W/2) * scale; ty = svg.clientHeight/2 - (p.y + H/2) * scale; transform(); } if (window.innerWidth <= 1100) { document.getElementById('inspector').classList.add('open'); document.getElementById('inspector-toggle').setAttribute('aria-expanded','true'); } }
+  function select(id, center = false) { selected = id; refresh(); renderInspector(); const p = positions.get(id); if (center && p && svg.style.display !== 'none') { tx = svg.clientWidth/2 - (p.x + p.width/2) * scale; ty = svg.clientHeight/2 - (p.y + p.height/2) * scale; transform(); } if (window.innerWidth <= 1100) { document.getElementById('inspector').classList.add('open'); document.getElementById('inspector-toggle').setAttribute('aria-expanded','true'); } }
   function refresh() {
     const matches = new Set(parts.filter(n => n.name.toLowerCase().includes(query) || n.files.some(f => f.toLowerCase().includes(query))).map(n => n.id));
     for (const el of world.querySelectorAll('.node')) { const id = el.dataset.id; el.classList.toggle('active',id === selected); el.classList.toggle('dim',(query && !matches.has(id)) || (selected && id !== selected && !links.some(e => e.source === selected && e.target === id || e.target === selected && e.source === id))); }
     for (const el of world.querySelectorAll('.edge,.edge-label-wrap')) { const connected = selected && (el.dataset.source === selected || el.dataset.target === selected); el.classList.toggle('focus',!!connected); el.classList.toggle('dim',!!selected && !connected); }
     for (const el of document.querySelectorAll('.component-item')) el.classList.toggle('active',el.dataset.id === selected);
+    for (const el of document.querySelectorAll('.data-row')) el.classList.toggle('active',el.dataset.id === selected);
   }
   function renderList() {
     const list = document.getElementById('component-list'); list.replaceChildren();
@@ -322,11 +448,27 @@
     const path = document.createElement('div'); path.className = 'inspector-path'; path.textContent = node.name;
     head.append(name,path); host.appendChild(head);
     const rule = document.createElement('div'); rule.className = 'accent-rule'; rule.style.background = color(node.id); host.appendChild(rule);
-    const related = (data.scope_edges[scopePath] || []).filter(e => e.source === node.id || e.target === node.id);
+    const related = (viewMode === 'system' ? data.system.edges : data.scope_edges[scopePath] || []).filter(e => e.source === node.id || e.target === node.id);
     const metrics = document.createElement('div'); metrics.className = 'detail-metrics';
     for (const [value,label] of [[node.count,'FILES'],[related.length,'CONNECTIONS']]) { const box = document.createElement('div'); const strong = document.createElement('strong'); strong.textContent = value; const span = document.createElement('span'); span.textContent = label; box.append(strong,span); metrics.appendChild(box); }
     host.appendChild(metrics);
-    if (node.role) { const role = document.createElement('p'); role.className = 'eyebrow'; role.textContent = `Jev role · ${node.role}`; host.appendChild(role); }
+    if (node.role) { const role = document.createElement('p'); role.className = 'eyebrow'; role.textContent = `${node.kind === 'system' ? 'Component role' : 'Jev role'} · ${node.role}`; host.appendChild(role); }
+    if (node.kind === 'system') {
+      const summary = document.createElement('p'); summary.className = 'side-copy'; summary.textContent = node.summary; host.appendChild(summary);
+      const section = document.createElement('section'); section.className = 'detail-section';
+      const heading = document.createElement('h3'); heading.textContent = 'Explore source areas'; section.appendChild(heading);
+      const members = document.createElement('div'); section.appendChild(members);
+      const showMembers = offset => {
+        members.replaceChildren();
+        for (const path of node.paths.slice(offset,offset+20)) { const button = document.createElement('button'); button.type = 'button'; button.className = 'component-item'; button.textContent = (path || 'Root files') + ' →'; button.addEventListener('click',() => enter(path)); members.appendChild(button); }
+        for (const [label,next] of [['← Previous source areas',offset-20],['More source areas →',offset+20]]) {
+          if (next < 0 || next >= node.paths.length) continue;
+          const button = document.createElement('button'); button.type = 'button'; button.className = 'top-button'; button.textContent = label; button.addEventListener('click',() => showMembers(next)); members.appendChild(button);
+        }
+      };
+      showMembers(0);
+      host.appendChild(section);
+    }
     if (node.kind === 'directory') {
       const open = document.createElement('button'); open.type = 'button'; open.className = 'top-button primary';
       open.textContent = 'Explore directory →'; open.addEventListener('click',() => enter(node.id)); host.appendChild(open);
@@ -334,11 +476,11 @@
     const addSection = (heading,items,asLinks = false) => {
       const section = document.createElement('section'); section.className = 'detail-section'; const h = document.createElement('h3'); h.textContent = heading; section.appendChild(h);
       if (!items.length) { const empty = document.createElement('p'); empty.textContent = 'No items in the bounded overview.'; section.appendChild(empty); }
-      else { const list = document.createElement('ul'); list.className = asLinks ? 'link-list' : 'file-list'; for (const item of items) { const li = document.createElement('li'); if (asLinks) { const button = document.createElement('button'); button.type = 'button'; const label = document.createElement('span'); label.textContent = item.id.startsWith('scope:') ? 'Current scope' : title(item.id); const count = document.createElement('small'); count.textContent = `${item.count} imports ↗`; button.append(label,count); button.addEventListener('click',() => focusPath(item.id)); li.appendChild(button); } else li.textContent = item; list.appendChild(li); } section.appendChild(list); }
+      else { const list = document.createElement('ul'); list.className = asLinks ? 'link-list' : 'file-list'; for (const item of items) { const li = document.createElement('li'); if (asLinks) { const button = document.createElement('button'); button.type = 'button'; const label = document.createElement('span'); label.textContent = item.direction + ' ' + (item.id.startsWith('scope:') ? 'Current scope' : title(byId.get(item.id)?.name || item.id)); const count = document.createElement('small'); count.textContent = `${item.count} imports ↗`; button.append(label,count); button.addEventListener('click',() => focusPath(item.id)); li.appendChild(button); } else li.textContent = item; list.appendChild(li); } section.appendChild(list); }
       host.appendChild(section);
     };
     addSection('Sample source paths',node.files);
-    addSection('Import connections',related.slice(0,20).map(e => ({id:e.source === node.id ? e.target : e.source,count:e.count})),true);
+    addSection('Import connections',related.slice(0,20).map(e => ({id:e.source === node.id ? e.target : e.source,count:e.count,direction:e.source === node.id ? '→' : '←'})),true);
   }
   let drag = null;
   svg.addEventListener('pointerdown',event => { if (event.target.closest('.node')) return; drag = {x:event.clientX,y:event.clientY,tx,ty}; svg.setPointerCapture(event.pointerId); svg.classList.add('dragging'); });
@@ -348,6 +490,25 @@
   document.getElementById('zoom-in').addEventListener('click',() => zoom(1.2));
   document.getElementById('zoom-out').addEventListener('click',() => zoom(1/1.2));
   document.getElementById('fit').addEventListener('click',fit);
+  function changeView(mode) {
+    if (mode === 'system' || viewMode === 'system') { query = ''; page = 0; document.getElementById('search').value = ''; }
+    viewMode = mode; document.getElementById('view-mode').value = mode; renderScope();
+  }
+  document.getElementById('view-mode').addEventListener('change',event => changeView(event.target.value));
+  document.getElementById('sort-mode').addEventListener('change',event => { sortMode = event.target.value; page = 0; renderScope(); });
+  document.getElementById('kind-filter').addEventListener('change',event => { kindFilter = event.target.value; page = 0; renderScope(); });
+  for (const [id,mode] of [['tab-system','system'],['tab-explore','atlas'],['tab-data','table']]) document.getElementById(id).addEventListener('click',() => changeView(mode));
+  document.querySelector('.view-tabs').addEventListener('keydown',event => {
+    if (!['ArrowLeft','ArrowRight','Home','End'].includes(event.key)) return;
+    event.preventDefault(); const tabs = [...document.querySelectorAll('.view-tabs button')], index = tabs.indexOf(document.activeElement);
+    const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length-1 : (index+(event.key === 'ArrowRight' ? 1 : -1)+tabs.length)%tabs.length;
+    tabs[next].focus(); tabs[next].click();
+  });
+  document.getElementById('export-csv').addEventListener('click',() => {
+    const blob = new Blob([RepoViews.csv(scopeEntries,counts)],{type:'text/csv;charset=utf-8'});
+    const url = URL.createObjectURL(blob), link = document.createElement('a');
+    link.href = url; link.download = data.name + '-scope.csv'; link.click(); setTimeout(() => URL.revokeObjectURL(url),1000);
+  });
   document.getElementById('search').addEventListener('input',event => { query = event.target.value.trim().toLowerCase(); page = 0; renderScope(); });
   document.getElementById('search').addEventListener('keydown',event => { if (event.key === 'Enter') { const first = parts.find(n => n.kind !== 'repository'); if (first) select(first.id,true); } });
   document.getElementById('up').addEventListener('click',() => enter(scopePath.split('/').slice(0,-1).join('/')));
