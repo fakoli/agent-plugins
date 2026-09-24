@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from io import BytesIO
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+import os
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "plugins/repo-graph/scripts/build_repo_graph.py"
@@ -14,35 +18,78 @@ SPEC.loader.exec_module(repo_graph)
 
 
 class RepoGraphTests(unittest.TestCase):
-    def test_large_diagram_is_bounded_and_escapes_labels(self) -> None:
-        nodes = [{"id": f"n{i}", "source_file": f"packages/part{i}/file.py",
-                  "file_type": "code"} for i in range(60)]
-        nodes[0]["source_file"] = 'packages/evil\"]; click n0 "https://bad.example"/file.py'
-        edges = [{"source": f"n{i}", "target": f"n{i+1}", "relation": "calls"}
-                 for i in range(59)]
-        source = repo_graph.mermaid({"nodes": nodes, "links": edges})
-
-        self.assertLessEqual(source.count('["'), repo_graph.MAX_GROUPS)
-        self.assertLessEqual(source.count(" -->"), repo_graph.MAX_EDGES)
-        self.assertNotIn("click n0", source)
-        self.assertIn("Other directories", source)
-        overview = repo_graph.overview_graph(source)
-        self.assertLessEqual(len(overview["nodes"]), repo_graph.MAX_GROUPS)
-        self.assertLessEqual(len(overview["edges"]), repo_graph.MAX_EDGES)
-
-    def test_inventory_uses_names_and_containment_without_hidden_files(self) -> None:
+    def test_go_links_tree_and_incremental_scan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "docs").mkdir()
-            (root / "docs" / "guide.md").write_text("private content", encoding="utf-8")
-            (root / "docs" / "second.md").write_text("more content", encoding="utf-8")
+            (root / "go.mod").write_text("module example.test/project\n", encoding="utf-8")
+            for name in ("api", "store"):
+                (root / name).mkdir()
+            (root / "api" / "main.go").write_text(
+                'package api\nimport (\n "example.test/project/store"\n "fmt"\n)\n',
+                encoding="utf-8")
+            (root / "store" / "store.go").write_text("package store\n", encoding="utf-8")
             (root / ".env").write_text("secret", encoding="utf-8")
-            graph = repo_graph.inventory_graph(root, root / "graph.json")
+            files = repo_graph.repo_files(root)
+            self.assertNotIn(".env", files)
+            tree = repo_graph.tree_index(files)
+            self.assertEqual(tree[""]["count"], len(files))
+            self.assertEqual(tree["api"]["count"], 1)
+            cache = root / ".scan-cache.json"
+            edges, first = repo_graph.extract_dependencies(root, files, tree, cache)
+            self.assertEqual(edges, [{"source": "api", "target": "store", "count": 1, "relation": "imports"}])
+            self.assertEqual(repo_graph.scope_edges(edges)[""][0]["target"], "store")
+            self.assertEqual(
+                repo_graph.scope_edges([{"source": "", "target": "api", "count": 1}])[""][0]["source"],
+                "scope:")
+            self.assertEqual(first["scanned"], 2)
+            self.assertEqual(repo_graph.extract_dependencies(root, files, tree, cache)[1]["reused"], 2)
 
-        self.assertEqual({node["source_file"] for node in graph["nodes"]},
-                         {"docs", "docs/guide.md", "docs/second.md"})
-        self.assertEqual(graph["edges"][0]["relation"], "contains")
-        self.assertNotIn("private content", str(graph))
+    def test_large_tree_keeps_every_directory_and_escapes_html(self) -> None:
+        files = [f"internal/service/s{i:03}/resource.go" for i in range(230)]
+        tree = repo_graph.tree_index(files)
+        self.assertEqual(len(tree["internal/service"]["children"]), 230)
+        self.assertEqual(tree["internal/service"]["count"], 230)
+        source = repo_graph.mermaid(tree, {})
+        self.assertLessEqual(source.count('["'), repo_graph.PAGE_SIZE)
+        self.assertLessEqual(source.count("-->") + source.count("-.->"), 40)
+        with tempfile.TemporaryDirectory() as directory:
+            page = Path(directory) / "architecture.html"
+            repo_graph.write_page(page, {"name": "</script><script>alert(1)</script>", "tree": tree})
+            html = page.read_text(encoding="utf-8")
+        self.assertNotIn("</script><script>alert(1)", html)
+        self.assertIn("u003c/script", html)
+
+    def test_jev_uses_one_bounded_typed_request_and_confidence_gate(self) -> None:
+        class Response(BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                self.close()
+
+        captured = {}
+        def fake_open(request, timeout):
+            captured["request"] = json.loads(request.data)
+            captured["timeout"] = timeout
+            return Response(json.dumps({"answers": {
+                "c0": {"type": "choice", "choice": "documentation", "confidence": .91},
+                "c1": {"type": "choice", "choice": "library", "confidence": .2},
+            }}).encode())
+        with patch.object(repo_graph, "urlopen", fake_open):
+            roles = repo_graph.jev_roles(["docs", "src"], "synthetic-key")
+        self.assertEqual(roles, {"docs": "documentation"})
+        self.assertEqual(captured["request"]["state"], {"directories": ["docs", "src"]})
+        self.assertEqual(len(captured["request"]["questions"]), 2)
+        self.assertEqual(captured["timeout"], 3)
+
+    def test_key_loader_reads_only_named_entry_without_sourcing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".env").write_text(
+                "IGNORED_KEY=synthetic-other-value\nexport TYPESAFE_API_KEY='synthetic-test-key'\n",
+                encoding="utf-8")
+            with patch.dict(os.environ, {}, clear=True), patch.object(repo_graph.Path, "home", return_value=home):
+                self.assertEqual(repo_graph.typesafe_key(), "synthetic-test-key")
 
 
 if __name__ == "__main__":
