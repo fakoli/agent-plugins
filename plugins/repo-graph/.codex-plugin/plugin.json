@@ -1,0 +1,18 @@
+{
+  "name": "repo-graph",
+  "version": "0.1.0",
+  "description": "Map local repositories as interactive graphs and bounded architecture diagrams without model calls.",
+  "author": {
+    "name": "Fakoli"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Repo Graph",
+    "shortDescription": "Local repository graphs and architecture diagrams",
+    "longDescription": "Build a Graphify code relationship graph, interactive views, and a compact Mermaid architecture overview from any local repository. Large inputs stay on disk and use no model tokens by default.",
+    "developerName": "Fakoli",
+    "category": "Productivity",
+    "capabilities": ["Write"],
+    "defaultPrompt": "Use $repo-graph to map this repository."
+  }
+}

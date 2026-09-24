@@ -24,9 +24,16 @@ codex plugin add session-improvement-loop@fakoli-agent-plugins
 | `workflow-intake` | Pin and adapt external procedures before executing them locally. |
 | `workspace-coordination` | Coordinate related repositories, worktrees, and ownership boundaries. |
 | `feature-retro` | Prepare retrospective design reviews, user journeys, evidence registers and article briefs after a feature build, without publishing. |
+| `repo-graph` | Build a local interactive code graph and bounded Mermaid architecture diagram for any repository. |
 
 Install any catalog entry with
 `codex plugin add <plugin-name>@fakoli-agent-plugins`.
+
+`$repo-graph /path/to/repo` writes an interactive graph, an architecture view,
+Mermaid source, and JSON under the user's cache. It uses Graphify's code-only
+extractor, so source is not sent to a model. If `graphify` is not installed,
+the command uses `uvx` to fetch `graphifyy` on first use. HTML views load
+viewer scripts from public CDNs when opened.
 
 ## Research and improvement
 
