@@ -1,7 +1,7 @@
 {
   "name": "repo-graph",
-  "version": "0.1.0",
-  "description": "Map local repositories as interactive graphs and bounded architecture diagrams without model calls.",
+  "version": "0.2.0",
+  "description": "Map local or public git repositories with offline interactive architecture diagrams and optional Jev roles.",
   "author": {
     "name": "Fakoli"
   },
@@ -9,7 +9,7 @@
   "interface": {
     "displayName": "Repo Graph",
     "shortDescription": "Local repository graphs and architecture diagrams",
-    "longDescription": "Build a Graphify code relationship graph, interactive views, and a compact Mermaid architecture overview from any local repository. Large inputs stay on disk and use no model tokens by default.",
+    "longDescription": "Build a clean-room, offline repository diagram with paged directory drilldown, local import links, a compact Mermaid overview, and optional Jev role labels. Large inputs stay on disk and use no model tokens by default.",
     "developerName": "Fakoli",
     "category": "Productivity",
     "capabilities": ["Write"],
