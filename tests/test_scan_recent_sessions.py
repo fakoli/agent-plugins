@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import runpy
+from unittest.mock import patch
 import subprocess
 import sys
 import tempfile
@@ -110,6 +112,31 @@ class ScanRecentSessionsTests(unittest.TestCase):
             self.assertEqual(default["session_count"], 0)
             self.assertEqual(default["active_sessions_excluded"], 1)
             self.assertEqual(included["sessions"][0]["status"], "active")
+
+    def test_current_mode_never_discovers_other_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            session = root / "selected.jsonl"
+            write_rows(session, [
+                {"type": "session_meta", "payload": {"id": "selected"}},
+                {"type": "event_msg", "payload": {"type": "task_started"}},
+            ])
+            write_rows(root / "unrelated.jsonl", [{"type": "session_meta", "payload": {"id": "unrelated"}}])
+            output = root / "result.json"
+            module = runpy.run_path(str(SCRIPT))
+            with patch.object(Path, "rglob", side_effect=AssertionError("broad discovery")):
+                self.assertEqual(module["main"](["current", "--session", str(session), "--output", str(output)]), 0)
+            result = json.loads(output.read_text())
+            self.assertEqual(result["scope"], "current-session")
+            self.assertTrue(result["live_snapshot"])
+            self.assertEqual([item["session_id"] for item in result["sessions"]], ["selected"])
+
+    def test_current_missing_session_fails_without_inventory_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            missing = str(Path(directory) / "missing.jsonl")
+            result = subprocess.run([sys.executable, str(SCRIPT), "current", "--session", missing], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
 
     def test_slice_redacts_secrets_paths_and_urls(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
