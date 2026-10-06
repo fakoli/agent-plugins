@@ -67,8 +67,10 @@
     {
       "name": "repo-graph",
       "source": {
-        "source": "local",
-        "path": "./plugins/repo-graph"
+        "source": "url",
+        "url": "https://github.com/fakoli/repo-graph.git",
+        "ref": "v0.6.0",
+        "sha": "b21a7c19fc3f068d3b0227ba1fa6acd5eda17280"
       },
       "policy": {
         "installation": "AVAILABLE",

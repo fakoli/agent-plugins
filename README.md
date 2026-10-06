@@ -6,7 +6,7 @@ Every contribution must be useful without private environment context, use synth
 
 ## Marketplace
 
-The Codex marketplace manifest is `.agents/plugins/marketplace.json`; plugin sources live under `plugins/`.
+The Codex marketplace manifest is `.agents/plugins/marketplace.json`; local plugin sources live under `plugins/`. Repo Graph is installed from its pinned canonical repository.
 
 Install the local checkout as a marketplace, then install a plugin:
 
@@ -38,14 +38,19 @@ treemap, a sortable data table, and a directed dependency matrix. Each view
 shares directory drilldown and filters; export the diagram as SVG or the
 filtered directory data as CSV.
 Repo Graph's canonical source is [fakoli/repo-graph](https://github.com/fakoli/repo-graph).
-The plugin is a pinned vendored release so installation needs no separate checkout.
+The catalog pins the canonical v0.6.0 release and exact commit. Codex fetches that source during installation; this marketplace carries no copied runtime or skill.
 Its generated SQLite index supports keyword search immediately and optional local
 CPU embeddings. The Search tab in `repo-graph serve OUTPUT` opens results in the
 diagram. The skill installs the optional semantic dependencies through the
-committed uv lock. [Setup, bounds, privacy and examples](plugins/repo-graph/README.md).
+committed uv lock. [Setup, bounds, privacy and examples](https://github.com/fakoli/repo-graph/blob/v0.6.0/README.md).
+
+Repo Graph is one product with Pi, Codex and Claude support. Its CLI provides
+`repo-graph init --harness pi|codex|claude|all`; see the canonical installation
+guide for setup and scope. Product tests and ADRs live in that repository.
+This catalog runs only its own entry and skill checks.
 
 Use `--jev` to opt into one speculative TypeSafe System One request for
-confident component role labels; this sends top-level directory names only.
+advisory component role labels; this sends top-level directory names only.
 
 ## Research and improvement
 
