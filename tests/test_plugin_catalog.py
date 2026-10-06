@@ -13,7 +13,16 @@ class PluginCatalogTests(unittest.TestCase):
     def test_marketplace_entries_resolve_to_matching_plugins(self) -> None:
         catalog = json.loads(MARKETPLACE.read_text(encoding="utf-8"))
 
+        self.assertEqual(len(catalog["plugins"]), len({entry["name"] for entry in catalog["plugins"]}))
         for entry in catalog["plugins"]:
+            self.assertEqual(entry["policy"]["installation"], "AVAILABLE")
+            if entry["source"]["source"] == "url":
+                self.assertEqual(entry["name"], "repo-graph")
+                self.assertEqual(entry["source"]["url"], "https://github.com/fakoli/repo-graph.git")
+                self.assertRegex(entry["source"]["ref"], r"^v\d+\.\d+\.\d+$")
+                self.assertRegex(entry["source"].get("sha", ""), r"^[0-9a-f]{40}$")
+                self.assertFalse((ROOT / "plugins" / "repo-graph").exists())
+                continue
             plugin = ROOT / entry["source"]["path"].removeprefix("./")
             manifest_path = plugin / ".codex-plugin" / "plugin.json"
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -25,7 +34,7 @@ class PluginCatalogTests(unittest.TestCase):
 
     def test_skills_have_complete_frontmatter_and_ui_prompts(self) -> None:
         catalog = json.loads(MARKETPLACE.read_text(encoding="utf-8"))
-        plugin_names = {entry["name"] for entry in catalog["plugins"]}
+        plugin_names = {entry["name"] for entry in catalog["plugins"] if entry["source"]["source"] == "local"}
         skills = (
             skill
             for plugin_name in plugin_names
