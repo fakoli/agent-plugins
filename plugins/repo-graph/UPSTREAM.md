@@ -20,9 +20,15 @@ Playwright 1.63.0 is a development-only browser-testing dependency. Locked
 Python and npm dependency metadata accompany the release. Local sources, model
 cache, benchmark databases and generated diagrams are excluded from Git.
 
+Version 0.5.0 adds optional bounded Jev shortlist judgments and local MiniLM
+reranking, using the same semantic extra. TypeSafe is an opt-in remote API;
+no SDK is added. The separately downloaded Xenova ONNX conversion of
+MS MARCO MiniLM L6 v2 is Apache-2.0; no weights or benchmark source are vendored.
+Research sources, frozen query comparisons and failure cases accompany the change.
+
 ## Marketplace snapshot
 
-The existing `fakoli/agent-plugins` entry vendors canonical Repo Graph 0.4.0
-from reviewed source commit `50f25f4954dcc9949ff5f30262d90d0265d62046`. Runtime,
+The existing `fakoli/agent-plugins` entry vendors canonical Repo Graph 0.5.0
+from reviewed source commit `db38cdf06902e19b234336f426d66d3785358e89`. Runtime,
 assets, scripts, skill, manifests, license and lock files are unchanged. The
 README research/evaluation links are adapted to the canonical public release.
