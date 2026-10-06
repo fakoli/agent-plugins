@@ -41,6 +41,15 @@
   .view-tabs button { flex:1; border:1px solid var(--line); border-radius:8px; padding:8px 4px; background:#fff; color:#53607a; font:700 11px "Segoe UI",sans-serif; }
   .view-tabs button[aria-selected="true"] { background:#273469; border-color:#273469; color:#fff; }
   .data-panel { position:absolute; inset:160px 24px 65px; overflow:auto; background:#ffffffee; border:1px solid var(--line); border-radius:12px; }
+  .search-panel { padding:24px; }
+  .search-panel form { display:flex; flex-wrap:wrap; gap:10px; }
+  .search-panel input { flex:1; min-width:160px; min-height:42px; border:1px solid var(--line); border-radius:8px; padding:10px; }
+  .search-panel select { border:1px solid var(--line); border-radius:8px; padding:10px; background:#fff; }
+  .search-status { color:var(--muted); margin:16px 0; }
+  .search-result { border-top:1px solid var(--line); padding:18px 0; }
+  .search-result h2 { font:600 14px monospace; overflow-wrap:anywhere; margin:0 0 8px; }
+  .search-result pre { white-space:pre-wrap; overflow-wrap:anywhere; font:12px/1.6 monospace; color:#53607a; max-height:160px; overflow:auto; }
+  .search-result button { border:1px solid var(--line); border-radius:8px; padding:8px 12px; background:var(--accent-pale); }
   .data-panel[hidden] { display:none; }
   .data-panel table { border-collapse:collapse; width:100%; font-size:12px; }
   .data-panel th,.data-panel td { padding:12px; text-align:left; border-bottom:1px solid #e8ecf3; white-space:nowrap; }
@@ -157,9 +166,9 @@
       <div class="eyebrow">01 / Overview</div>
       <h2 class="side-title">The shape<br>of the repo.</h2>
       <p class="side-copy">A grounded map of files and relationships. Select a component to follow its connections.</p>
-      <div class="view-tabs" role="tablist" aria-label="Repository views"><button type="button" role="tab" id="tab-system" aria-selected="false">System</button><button type="button" role="tab" id="tab-explore" aria-selected="true">Explore</button><button type="button" role="tab" id="tab-data" aria-selected="false">Data</button></div>
+      <div class="view-tabs" role="tablist" aria-label="Repository views"><button type="button" role="tab" id="tab-system" aria-selected="false">System</button><button type="button" role="tab" id="tab-explore" aria-selected="true">Explore</button><button type="button" role="tab" id="tab-data" aria-selected="false">Data</button><button type="button" role="tab" id="tab-search" aria-selected="false">Search</button></div>
       <div class="view-options">
-        <label>View<select id="view-mode"><option value="system">System overview</option><option value="atlas" selected>Card diagram</option><option value="tree">Top-down tree</option><option value="radial">Radial map</option><option value="treemap">File-count treemap</option><option value="table">Data table</option><option value="matrix">Dependency matrix</option></select></label>
+        <label>View<select id="view-mode"><option value="system">System overview</option><option value="atlas" selected>Card diagram</option><option value="tree">Top-down tree</option><option value="radial">Radial map</option><option value="treemap">File-count treemap</option><option value="table">Data table</option><option value="matrix">Dependency matrix</option><option value="search">Repository search</option></select></label>
         <label>Sort<select id="sort-mode"><option value="name">Name</option><option value="files">Most files</option><option value="imports">Most imports</option></select></label>
         <label>Show<select id="kind-filter"><option value="all">Directories and files</option><option value="directory">Directories</option><option value="file">Files</option></select></label>
       </div>
@@ -211,10 +220,13 @@ __VIEW_HELPERS__
   document.getElementById('stat-files').textContent = data.file_count.toLocaleString();
 
   function renderScope() {
-    for (const [id,active] of [['tab-system',viewMode === 'system'],['tab-data',['table','matrix'].includes(viewMode)],['tab-explore',['atlas','tree','radial','treemap'].includes(viewMode)]]) document.getElementById(id).setAttribute('aria-selected',String(active));
+    for (const [id,active] of [['tab-system',viewMode === 'system'],['tab-data',['table','matrix'].includes(viewMode)],['tab-search',viewMode === 'search'],['tab-explore',['atlas','tree','radial','treemap'].includes(viewMode)]]) document.getElementById(id).setAttribute('aria-selected',String(active));
     document.getElementById('sort-mode').disabled = viewMode === 'system';
     document.getElementById('kind-filter').disabled = viewMode === 'system';
+    document.getElementById('search').hidden = viewMode === 'search';
+    if (viewMode === 'search') { renderSearch(); return; }
     if (viewMode === 'system') { renderSystem(); return; }
+    document.getElementById('export-csv').disabled = false;
     const branch = data.tree[scopePath];
     const directories = branch.children.map(path => ({id:path,name:path,count:data.tree[path].count,files:data.tree[path].sample,kind:'directory',role:data.roles[path]}));
     const files = branch.direct.map(path => ({id:'file:' + path,name:path,count:1,files:[path],kind:'file'}));
@@ -258,6 +270,68 @@ __VIEW_HELPERS__
     if (!isData) requestAnimationFrame(() => { fit(); if (scale < .65) { scale = .75; tx = 28; ty = 118; transform(); } });
   }
 
+  let lastSearch = '', lastResults = null, searchRequest = 0;
+  function renderSearch() {
+    selected = null; parts = []; links = []; scopeEntries = [];
+    document.getElementById('map-title').textContent = 'Search the repository';
+    document.getElementById('map-subtitle').textContent = 'Find source areas by meaning or exact identifiers, then explore their connections.';
+    document.getElementById('breadcrumb').textContent = data.name;
+    document.getElementById('page-label').textContent = 'Whole repository';
+    for (const id of ['up','previous','next','export-svg','export-csv']) document.getElementById(id).disabled = true;
+    svg.style.display = 'none';
+    document.querySelector('.controls').style.display = 'none';
+    document.querySelector('.legend').style.display = 'none';
+    document.querySelector('.stage-hint').style.display = 'none';
+    document.getElementById('component-list').replaceChildren();
+    document.getElementById('list-count').textContent = '0';
+    const host = document.getElementById('data-panel'); host.hidden = false; host.replaceChildren();
+    const panel = document.createElement('section'); panel.className = 'search-panel'; host.appendChild(panel);
+    const form = document.createElement('form'); panel.appendChild(form);
+    const input = document.createElement('input'); input.type = 'search'; input.placeholder = 'How are access permissions checked?'; input.value = lastSearch;
+    input.setAttribute('aria-label','Repository search query'); input.required = true; input.maxLength = 1000;
+    const mode = document.createElement('select'); mode.setAttribute('aria-label','Search method');
+    for (const [value,label] of [['hybrid','Meaning + keywords'],['semantic','Meaning'],['keyword','Keywords']]) { const option = document.createElement('option'); option.value = value; option.textContent = label; mode.appendChild(option); }
+    const submit = document.createElement('button'); submit.type = 'submit'; submit.className = 'top-button primary'; submit.textContent = 'Search';
+    form.append(input,mode,submit);
+    const status = document.createElement('p'); status.className = 'search-status'; status.setAttribute('role','status'); status.setAttribute('aria-live','polite'); panel.appendChild(status);
+    const results = document.createElement('div'); panel.appendChild(results);
+    const show = response => {
+      results.replaceChildren();
+      status.textContent = response.results.length ? `${response.results.length} results · ${response.documents.toLocaleString()} indexed files · ${Math.round(response.seconds*1000)} ms` : 'No matching files. Try another description or use keywords.';
+      for (const hit of response.results) {
+        const article = document.createElement('article'); article.className = 'search-result';
+        const heading = document.createElement('h2'); heading.textContent = hit.path;
+        const evidence = document.createElement('pre'); evidence.textContent = hit.evidence;
+        const open = document.createElement('button'); open.type = 'button'; open.textContent = 'Open in diagram →';
+        open.addEventListener('click',() => { viewMode = 'atlas'; document.getElementById('view-mode').value = 'atlas'; document.getElementById('export-csv').disabled = false; enter(hit.path.split('/').slice(0,-1).join('/')); focusPath('file:'+hit.path); });
+        article.append(heading,evidence,open); results.appendChild(article);
+      }
+    };
+    const online = location.protocol === 'http:' && location.hostname === '127.0.0.1';
+    if (!online) {
+      submit.disabled = true; input.disabled = true; mode.disabled = true;
+      status.textContent = 'To search this map, run repo-graph serve with the output directory shown by the scan, then open its local URL. Build meaning search once with repo-graph index OUTPUT --semantic. Offline diagrams remain available in the other tabs.';
+    } else {
+      status.textContent = 'Search the whole repository. Meaning search needs a locally embedded index.';
+      fetch('/api/status').then(response => response.json()).then(state => {
+        if (!state.semantic) { mode.value = 'keyword'; mode.options[0].disabled = true; mode.options[1].disabled = true; status.textContent = 'Keyword index ready. Enable meaning search with repo-graph index OUTPUT --semantic, then restart this viewer.'; }
+      }).catch(() => { status.textContent = 'Search service is unavailable. Restart repo-graph serve.'; });
+      if (lastResults) show(lastResults);
+      form.addEventListener('submit',async event => {
+        event.preventDefault(); const request = ++searchRequest;
+        lastSearch = input.value.trim(); if (!lastSearch) return;
+        submit.disabled = true; status.textContent = 'Searching…'; results.replaceChildren();
+        try {
+          const response = await fetch('/api/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:lastSearch,mode:mode.value})});
+          const body = await response.json(); if (request !== searchRequest || viewMode !== 'search') return;
+          if (!response.ok) throw new Error(body.error || 'Search failed');
+          lastResults = body; show(body);
+        } catch (error) { if (request === searchRequest && viewMode === 'search') status.textContent = error.message; }
+        finally { submit.disabled = false; }
+      });
+    }
+  }
+
   function enter(path) {
     if (!data.tree[path]) return;
     if (viewMode === 'system') { viewMode = 'atlas'; kindFilter = 'all'; document.getElementById('kind-filter').value = 'all'; document.getElementById('view-mode').value = viewMode; }
@@ -285,6 +359,7 @@ __VIEW_HELPERS__
   }
 
   function renderSystem() {
+    document.getElementById('export-csv').disabled = false;
     scopePath = ''; page = 0;
     parts = (data.system?.nodes || []).filter(node => (node.name + ' ' + node.summary).toLowerCase().includes(query));
     scopeEntries = parts;
@@ -497,7 +572,7 @@ __VIEW_HELPERS__
   document.getElementById('view-mode').addEventListener('change',event => changeView(event.target.value));
   document.getElementById('sort-mode').addEventListener('change',event => { sortMode = event.target.value; page = 0; renderScope(); });
   document.getElementById('kind-filter').addEventListener('change',event => { kindFilter = event.target.value; page = 0; renderScope(); });
-  for (const [id,mode] of [['tab-system','system'],['tab-explore','atlas'],['tab-data','table']]) document.getElementById(id).addEventListener('click',() => changeView(mode));
+  for (const [id,mode] of [['tab-system','system'],['tab-explore','atlas'],['tab-data','table'],['tab-search','search']]) document.getElementById(id).addEventListener('click',() => changeView(mode));
   document.querySelector('.view-tabs').addEventListener('keydown',event => {
     if (!['ArrowLeft','ArrowRight','Home','End'].includes(event.key)) return;
     event.preventDefault(); const tabs = [...document.querySelectorAll('.view-tabs button')], index = tabs.indexOf(document.activeElement);

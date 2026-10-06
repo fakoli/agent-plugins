@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict');
-const views = require('../plugins/repo-graph/assets/views.js');
+const views = require('../plugins/repo-graph/repo_graph/assets/views.js');
 const nodes = [{id:'root',name:'Repo',kind:'repository',count:300},
   ...Array.from({length:23},(_,i) => ({id:'n'+i,name:'Component '+i,kind:'directory',count:i+1,layer:i%4}))];
 for (const mode of ['atlas','tree','radial','treemap','system']) {
@@ -54,8 +54,8 @@ class Element {
   getTotalLength() { return 100; }
   getPointAtLength() { return {x:100,y:100}; }
 }
-const template=fs.readFileSync(require('node:path').join(__dirname,'../plugins/repo-graph/assets/diagram.html'),'utf8');
-const helpers=fs.readFileSync(require('node:path').join(__dirname,'../plugins/repo-graph/assets/views.js'),'utf8');
+const template=fs.readFileSync(require('node:path').join(__dirname,'../plugins/repo-graph/repo_graph/assets/diagram.html'),'utf8');
+const helpers=fs.readFileSync(require('node:path').join(__dirname,'../plugins/repo-graph/repo_graph/assets/views.js'),'utf8');
 const elements=new Map([...template.matchAll(/id="([^"]+)"/g)].map(match=>[match[1],new Element()]));
 const extra=new Map(), get=id=>elements.get(id);
 const fixture={name:'Synthetic',file_count:62,roles:{},jev:'off',tree:{'':{count:62,children:['docs','src'],direct:['main.py'],sample:['main.py']},docs:{count:1,children:[],direct:['docs/guide.md'],sample:['docs/guide.md']},src:{count:60,children:[],direct:[],sample:[]}},scope_edges:{src:[{source:'src/c00',target:'src/c25',count:7,relation:'imports'}]},system:{nodes:[{id:'system:0',name:'Sources',kind:'system',count:60,layer:1,role:'runtime',files:[],paths:['src'],summary:'Source packages'}],edges:[]}};

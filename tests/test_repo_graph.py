@@ -10,7 +10,7 @@ from unittest.mock import patch
 import os
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "plugins/repo-graph/scripts/build_repo_graph.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "plugins/repo-graph/repo_graph/builder.py"
 SPEC = importlib.util.spec_from_file_location("build_repo_graph", SCRIPT)
 assert SPEC and SPEC.loader
 repo_graph = importlib.util.module_from_spec(SPEC)
@@ -43,6 +43,12 @@ class RepoGraphTests(unittest.TestCase):
                 "scope:")
             self.assertEqual(first["scanned"], 2)
             self.assertEqual(repo_graph.extract_dependencies(root, files, tree, cache)[1]["reused"], 2)
+
+    def test_unresolved_relative_imports_do_not_create_false_edges(self) -> None:
+        tree = repo_graph.tree_index(['src/app.ts','src/store.ts','pkg/main.py'])
+        self.assertEqual(repo_graph.local_target('src/app.ts','./store','',tree),'src')
+        self.assertIsNone(repo_graph.local_target('src/app.ts','./missing','',tree))
+        self.assertIsNone(repo_graph.local_target('pkg/main.py','unknown_package','',tree))
 
     def test_large_tree_keeps_every_directory_and_escapes_html(self) -> None:
         files = [f"internal/service/s{i:03}/resource.go" for i in range(230)]

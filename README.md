@@ -24,7 +24,7 @@ codex plugin add session-improvement-loop@fakoli-agent-plugins
 | `workflow-intake` | Pin and adapt external procedures before executing them locally. |
 | `workspace-coordination` | Coordinate related repositories, worktrees, and ownership boundaries. |
 | `feature-retro` | Prepare retrospective design reviews, user journeys, evidence registers and article briefs after a feature build, without publishing. |
-| `repo-graph` | Build an offline interactive repository diagram with paged drilldown and local import links. |
+| `repo-graph` | Build offline system diagrams and incremental local semantic/keyword search with bounded results. |
 
 Install any catalog entry with
 `codex plugin add <plugin-name>@fakoli-agent-plugins`.
@@ -37,6 +37,13 @@ The viewer includes a System tab, card/tree/radial diagrams, a file-count
 treemap, a sortable data table, and a directed dependency matrix. Each view
 shares directory drilldown and filters; export the diagram as SVG or the
 filtered directory data as CSV.
+Repo Graph's canonical source is [fakoli/repo-graph](https://github.com/fakoli/repo-graph).
+The plugin is a pinned vendored release so installation needs no separate checkout.
+Its generated SQLite index supports keyword search immediately and optional local
+CPU embeddings. The Search tab in `repo-graph serve OUTPUT` opens results in the
+diagram. The skill installs the optional semantic dependencies through the
+committed uv lock. [Setup, bounds, privacy and examples](plugins/repo-graph/README.md).
+
 Use `--jev` to opt into one speculative TypeSafe System One request for
 confident component role labels; this sends top-level directory names only.
 
