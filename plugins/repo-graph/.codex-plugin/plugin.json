@@ -1,7 +1,7 @@
 {
   "name": "repo-graph",
-  "version": "0.3.0",
-  "description": "Map local or public git repositories with offline interactive architecture diagrams and optional Jev roles.",
+  "version": "0.4.0",
+  "description": "Offline repository diagrams and incremental local semantic search for large codebases.",
   "author": {
     "name": "Fakoli"
   },
@@ -9,10 +9,12 @@
   "interface": {
     "displayName": "Repo Graph",
     "shortDescription": "Local repository graphs and architecture diagrams",
-    "longDescription": "Explore repository system architecture, card/tree/radial diagrams, a file-count treemap, data tables, and a dependency matrix. Offline views share bounded drilldown, sorting, filtering, CSV and SVG export, and optional Jev role labels.",
+    "longDescription": "Explore system, card, tree, radial and treemap diagrams, table and matrix data, then find source files with local semantic and keyword search. Bounded agent results, reusable indexes and offline CPU embeddings.",
     "developerName": "Fakoli",
     "category": "Productivity",
-    "capabilities": ["Write"],
+    "capabilities": [
+      "Write"
+    ],
     "defaultPrompt": "Use $repo-graph to map this repository."
   }
 }
