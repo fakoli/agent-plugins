@@ -21,10 +21,21 @@ research authority. Use the host's native delegation mechanism when it exists;
 otherwise do lead-only research and label the reduced coverage. Re-reading
 the same context is not an independent worker answer.
 
+## Start with one shared source registry
+
+Use one initial researcher (normally the lead). Reuse the project's source
+registry; if none exists, retain a compact table with URL or artifact path,
+published/observed date, exact revision, applicability, decisive claim and
+remaining uncertainty. Search only gaps in that registry. Repeated links to
+one underlying result count as one source. A local-only investigation uses
+local artifacts and tests without external searches.
+
 ## Decide whether to fan out
 
-Use three independent answers when a material shortlist, ambiguous
-failure, or competing approach remains unresolved and the answers can change
+Expand only for a named material decision that remains unresolved after the
+initial pass. Record the conflicting evidence, the unknown that can change the
+next action, and the smallest distinguishing check in the shared registry.
+Use three independent answers for that bounded gap when the answers can change
 the next experiment or decision. Run them concurrently only when slots and the
 shared budget permit. Do not create a panel to restate an established answer,
 for every parameter change, or merely for agent count.
