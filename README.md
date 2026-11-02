@@ -19,7 +19,7 @@ codex plugin add session-improvement-loop@fakoli-agent-plugins
 
 | Plugin | Purpose |
 |---|---|
-| `session-improvement-loop` | Research uncertain decisions, evaluate scoped skill changes, and turn session friction into validated improvements. |
+| `session-improvement-loop` | Research decisions and local inference candidates, evaluate scoped skill changes, and turn session friction into validated improvements. |
 | `host-operations` | Diagnose Windows GPU ownership and environment credential loading safely. |
 | `workflow-intake` | Pin and adapt external procedures before executing them locally. |
 | `workspace-coordination` | Coordinate related repositories, worktrees, and ownership boundaries. |
@@ -54,10 +54,12 @@ advisory component role labels; this sends top-level directory names only.
 
 ## Research and improvement
 
-The `session-improvement-loop` plugin provides three entrypoints:
+The `session-improvement-loop` plugin provides four entrypoints:
 
 - `$research-synthesis`: independent evidence gathering and one synthesis for
   a material unresolved decision, with native host agents and a shared budget.
+- `$local-inference-research`: source-specific benchmark research, Chrome access
+  when needed, and compact hardware-matched comparisons with explicit evidence limits.
 - `$skill-improvement`: one evidence-backed instruction proposal, frozen
   versions, independent checks, and scoped adoption or rejection.
 - `$review-session-improvements`: bounded session inventory and evidence

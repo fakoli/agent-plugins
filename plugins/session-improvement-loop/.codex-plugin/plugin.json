@@ -1,7 +1,7 @@
 {
   "name": "session-improvement-loop",
-  "version": "0.1.0+codex.20260913190724",
-  "description": "Research uncertain decisions and independently validate reusable improvements from task or session evidence.",
+  "version": "0.2.0",
+  "description": "Research uncertain decisions and local inference candidates, and independently validate reusable workflow improvements.",
   "author": {
     "name": "Fakoli",
     "url": "https://github.com/fakoli"
@@ -19,7 +19,7 @@
   "interface": {
     "displayName": "Session Improvement Loop",
     "shortDescription": "Research decisions and validate scoped skill improvements.",
-    "longDescription": "Portable research synthesis, independent skill improvement, and bounded session review. Reuses native agents and project evidence, preserves budget and authority, and loads Astra guidance only when relevant.",
+    "longDescription": "Portable research synthesis, source-guided local inference comparisons, independent skill improvement, and bounded session review. Preserves the host provider, evidence limits, budgets and operational authority.",
     "developerName": "Fakoli",
     "category": "Productivity",
     "capabilities": [
@@ -29,7 +29,8 @@
     "defaultPrompt": [
       "Research this decision using independent evidence and a shared budget.",
       "Evaluate one evidence-backed improvement to this workflow.",
-      "Review recent sessions for reusable improvements."
+      "Review recent sessions for reusable improvements.",
+      "Compare local inference candidates using hardware-matched evidence and source-specific research checklists."
     ]
   }
 }
