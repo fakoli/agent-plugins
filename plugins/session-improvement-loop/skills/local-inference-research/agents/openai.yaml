@@ -1,4 +1,4 @@
 interface:
   display_name: "Local Inference Research"
   short_description: "Find inference advances relevant to your hardware"
-  default_prompt: "Use $local-inference-research to review recent developments for my setup, follow the relevant source checklists, and return a cited comparison with evidence limits and next checks."
+  default_prompt: "Use $local-inference-research to consult my project's existing model decisions, check material changes for my setup, and return a cited comparison with evidence limits and reopening conditions. Update the tracker when authorized."

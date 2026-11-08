@@ -2,6 +2,40 @@
 
 Read only the source checklist needed for this task, then the comparison gate.
 
+## Continuing decision record
+
+Use the project's established Page, repository ledger or other authorized store.
+The tracker is a navigation and decision record, not proof of current runtime
+state. Load its recommendation and matching rows before full reports or raw runs.
+Create a tracker only when requested; a one-off answer needs no new store.
+
+Keep one candidate row unless a different exact artifact, role or deployment
+changes the decision. A useful row records:
+
+| Candidate and role | Decision and rationale | Decisive evidence | Last checked | Reopen when |
+| --- | --- | --- | --- | --- |
+| Model/artifact revision and intended workload | Current reference, investigate, watch, complementary or defer | Direct sources/runs, evaluation version, comparison fit and missing checks | Observation date and actual checked scope | A specific new artifact, supported fit, task result or changed requirement |
+
+Keep the baseline's model/quant/runtime identity and observation date alongside
+the table. Separate best supported local choice, external quality lead and
+smaller/faster alternative; do not combine unrelated quality and speed metrics
+into one score. A low-bit derivative does not inherit its parent's benchmark.
+
+Append a dated review recording the question, checked sources, material changes
+or no-change outcome, superseded decision and reason, unresolved blocker and
+smallest next check. Track last material change separately from last checked.
+When a source retracts or corrects a result, mark the affected claim superseded
+and reevaluate only decisions depending on it. Count unique entries and actual
+reviews from the record; mirrors, retries and repeated summaries are not extra
+models, independent evidence or experiments. Do not backfill invented review counts.
+
+A fresh status query can reuse a still-supported decision while a material delta
+reopens only its affected row. An explicitly requested broad survey may expand
+coverage. Before a write, read the target and preserve concurrent edits using
+its supported guards. Verify the saved rows, tally and evidence links afterward.
+If access fails, retain an explicit unsaved result rather than silently creating
+a competing record. Tracking does not schedule refreshes or authorize trials.
+
 ## Source selection
 
 Read the checklist matching the question; use `sources.md` for URLs. For mixed

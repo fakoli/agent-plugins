@@ -1,6 +1,6 @@
 ---
 name: local-inference-research
-description: "Research local inference models, runtimes, quantization, and agent harnesses against the user's hardware and workloads. Use for LocalMaxxing, Local Inference Lab benchmarks or daily summaries, and hardware-specific comparisons; produces cited research, not deployment or model qualification."
+description: "Research local inference models, runtimes, quantization, and agent harnesses against the user's hardware and workloads. Reuse a project's model decision tracker for repeated comparisons and refresh changed evidence. Produces cited research, not deployment or model qualification."
 ---
 
 # Local Inference Research
@@ -8,6 +8,25 @@ description: "Research local inference models, runtimes, quantization, and agent
 Find developments that could improve the requested workload. A useful conclusion
 can be that nothing warrants a change. Follow the same evidence workflow with a
 local model, Sol, Astra, or Terra; do not change providers or require delegation.
+
+## 0. Consult the existing decision record
+
+Resolve the project's research tracker from its instructions, supplied link or
+focused prior context. Read its summary first, then only relevant candidate rows,
+rejected approaches and evidence. Keep the established store; do not create a
+second tracker or require a database/plugin installation.
+
+For a historical question, answer from sufficient dated evidence. For “latest,”
+“better now” or changed constraints, check what changed since the last review:
+artifact, runtime support, hardware fit, evaluation method or relevant task result.
+An unchanged row with no satisfied reopening condition needs no full re-review.
+Use a bounded current-source check when needed to establish that it is unchanged;
+old memory alone cannot establish current availability or performance.
+
+If the tracker cannot be read, disclose the gap and continue useful source work;
+do not invent prior decisions or claim the tracker was updated. Read the
+[continuing decision record guide](references/research-guide.md#continuing-decision-record)
+when the user requests tracking or an existing tracker needs maintenance.
 
 ## 1. Frame the question
 
@@ -49,6 +68,10 @@ public HTTP/JSON or the browser; no single provider or model is required.
    corrections and explicitly mark superseded results.
 5. Deduplicate by original run/artifact and author. A report, repost and daily
    summary quoting the report are one observation, not three reproductions.
+
+Before delivery, check that each decisive citation supports the exact associated
+claim, variant, date and metric. Label an inference; narrow or remove a claim
+whose source does not support it. Source count does not replace this check.
 
 Prefer documented structured endpoints for filtering, then retain the direct
 human-readable source link. Fetch independent pages in small batches and inspect
@@ -93,6 +116,12 @@ family at a time and carry these records forward instead of raw HTML, full API
 dumps or repeated transcripts. Report incomplete coverage rather than weakening
 evidence checks. Use concise Markdown for humans and models; JSON is optional
 when requested by a downstream consumer.
+
+For continuing research, update the authorized decision record before claiming
+it is saved. Preserve superseded decisions and their reasons; distinguish a
+no-change source check from a new experiment. Return the tracker link and the
+material delta, or a dated no-change result with its coverage. If saving fails,
+deliver the findings and report the unsaved update explicitly.
 
 ## Boundaries
 

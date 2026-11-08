@@ -1,6 +1,6 @@
 {
   "name": "session-improvement-loop",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Research uncertain decisions and local inference candidates, and independently validate reusable workflow improvements.",
   "author": {
     "name": "Fakoli",

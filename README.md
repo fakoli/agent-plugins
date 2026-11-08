@@ -60,6 +60,9 @@ The `session-improvement-loop` plugin provides four entrypoints:
   a material unresolved decision, with native host agents and a shared budget.
 - `$local-inference-research`: source-specific benchmark research, Chrome access
   when needed, and compact hardware-matched comparisons with explicit evidence limits.
+  Reuses the project's decision tracker before searching, refreshes material
+  changes, and preserves dated decisions and concrete reopening conditions.
+  [Workflow comparison and validation scope](docs/local-inference-research-comparison.md).
 - `$skill-improvement`: one evidence-backed instruction proposal, frozen
   versions, independent checks, and scoped adoption or rejection.
 - `$review-session-improvements`: bounded session inventory and evidence
