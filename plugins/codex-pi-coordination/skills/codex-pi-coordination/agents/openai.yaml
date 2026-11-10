@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Pi Coordination"
+  short_description: "Delegate bounded tasks to Pi with evidence and owned cleanup"
+  default_prompt: "Use $codex-pi-coordination to delegate this task to Pi and verify its returned work."

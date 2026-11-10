@@ -1,0 +1,11 @@
+{
+  "name": "codex-pi-coordination",
+  "version": "0.1.0",
+  "description": "Bounded Pi task handoff for an external Codex coordinator",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=22" },
+  "files": [".codex-plugin/plugin.json", "extensions/coordination.js", "scripts/coordinate.py", "skills"],
+  "pi": { "extensions": ["./extensions/coordination.js"] },
+  "scripts": { "test:extension": "node --test tests/extension.test.mjs" }
+}

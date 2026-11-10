@@ -24,6 +24,7 @@ codex plugin add session-improvement-loop@fakoli-agent-plugins
 | `workflow-intake` | Pin and adapt external procedures before executing them locally. |
 | `workspace-coordination` | Coordinate related repositories, worktrees, and ownership boundaries. |
 | `feature-retro` | Prepare retrospective design reviews, user journeys, evidence registers and article briefs after a feature build, without publishing. |
+| [`codex-pi-coordination`](plugins/codex-pi-coordination/README.md) | Delegate bounded implementation, research, review and validation to Pi in an owned OpenShell sandbox, with recorded checks and cleanup. |
 | `repo-graph` | Build offline system diagrams and incremental local semantic/keyword search with bounded results. |
 
 Install any catalog entry with
