@@ -44,6 +44,29 @@ if behavior!='missing-report':
 events=[{'type':'tool_execution_start','toolCallId':'call-1','toolName':'coordination_handoff'}, {'type':'tool_execution_end','toolCallId':'call-1','isError':False}, {'type':'message_end','message':{'role':'assistant','stopReason':'stop'}}, {'type':'agent_end'}]
 if behavior=='missing-end': events.pop()
 if behavior=='duplicate-id': events[2:2]=events[:2]
+if behavior in ('pre-guard-error','unguarded-success'):
+    events[:0]=[{'type':'tool_execution_start','toolCallId':'schema-attempt','toolName':'coordination_handoff'},{'type':'tool_execution_end','toolCallId':'schema-attempt','isError':behavior=='pre-guard-error'}]
+task_digest=hashlib.sha256(task_path.read_bytes()).hexdigest()
+def extension_event(kind, calls=1, turns=1, handed_off=True, **fields):
+    return {'type':kind,'at':'2000-01-01T00:00:00Z','active':True,'run_id':task['run_id'],'task_id':task['task_id'],'task_sha256':task_digest,'tool_calls':calls,'turns':turns,'handed_off':handed_off,**fields}
+extension_events=[extension_event('task_loaded',0,0,False),extension_event('tool_call',handed_off=False,tool_name='coordination_handoff',tool_call_id='call-1'),extension_event('handoff',reported_status=report['status']),extension_event('agent_settled'),extension_event('session_shutdown')]
+if behavior=='extension-refused': extension_events.insert(3,extension_event('refused',failure={'code':'task_unavailable','message':'No further tools'},code='task_unavailable'))
+if behavior=='extension-failure': extension_events[-1]['failure']={'code':'tool_budget_exhausted','message':'Budget exhausted'}
+if behavior=='extension-wrong-run': extension_events[1]['run_id']='different-run'
+if behavior=='extension-wrong-task': extension_events[1]['task_id']='different-task'
+if behavior=='extension-wrong-digest': extension_events[1]['task_sha256']='0'*64
+if behavior=='extension-missing-loaded': extension_events.pop(0)
+if behavior=='extension-duplicate-handoff': extension_events.insert(3,dict(extension_events[2]))
+if behavior=='extension-missing-settled': extension_events.pop(-2)
+if behavior=='extension-missing-shutdown': extension_events.pop()
+if behavior=='extension-trailing-event': extension_events.append(extension_event('tool_call',calls=2,tool_name='read',tool_call_id='late-read'))
+if behavior=='extension-tool-count': extension_events[-1]['tool_calls']=2
+if behavior=='extension-turn-count': extension_events[-1]['turns']=2
+if behavior=='extension-tool-identity': extension_events[1]['tool_call_id']='unrelated-call'
+if behavior=='extension-tool-name': extension_events[1]['tool_name']='read'
+if behavior!='extension-missing':
+    with (output/'extension-events.jsonl').open('x') as stream:
+        for event in extension_events: stream.write(json.dumps(event)+'\n')
 for event in events: print(json.dumps(event),flush=True)
 raise SystemExit(7 if behavior=='exit-seven' else 0)
 '''
@@ -178,7 +201,7 @@ class WorkerTests(unittest.TestCase):
                 "output_directory": str(output), "writable_paths": ["answer.txt"],
                 "allowed_tools": ["read", "write"], "max_tool_calls": 10, "max_turns": 10,
                 "checks": checks or [],
-                "source": {"files": {"answer.txt": coordinate.digest(b"before\n")}}}
+                "source": {"kind": "synthetic", "modes": {}, "files": {"answer.txt": coordinate.digest(b"before\n")}}}
         dump(root / "task.json", task)
         dump(root / "launch.json", {"pi_argv": [sys.executable, str(fake), behavior],
                                    "model": "example/model", "thinking": "high", "environment": {},
@@ -231,6 +254,105 @@ class WorkerTests(unittest.TestCase):
                 receipt = coordinate.read_json(root / "results/worker-receipt.json")
                 self.assertNotEqual(receipt["outcome"], "returned")
                 self.assertTrue((root / "results/pi-events.jsonl").exists())
+
+    def test_missing_refused_or_inconsistent_extension_proof_never_returns_success(self):
+        for behavior in ["extension-missing", "extension-refused", "extension-failure",
+                         "extension-wrong-run", "extension-wrong-task", "extension-wrong-digest",
+                         "extension-missing-loaded", "extension-duplicate-handoff",
+                         "extension-missing-settled", "extension-missing-shutdown",
+                         "extension-trailing-event", "extension-tool-count", "extension-turn-count",
+                         "extension-tool-identity", "extension-tool-name"]:
+            with self.subTest(behavior=behavior):
+                root = self.prepare(name=behavior, behavior=behavior)
+                self.assertEqual(coordinate.worker(root), 1)
+                receipt = coordinate.read_json(root / "results/worker-receipt.json")
+                self.assertNotEqual(receipt["outcome"], "returned")
+                # Each negative still has a normally completed Pi stream. The
+                # extension's task-policy proof must independently gate return.
+                observed = coordinate.inspect_events(root / "results/pi-events.jsonl", 10, 10)
+                self.assertEqual(observed["tool_calls"], 1)
+                self.assertEqual(observed["assistant_turns"], 1)
+
+    def test_native_schema_error_can_recover_but_unguarded_success_cannot(self):
+        for behavior, expected_exit in [("pre-guard-error", 0), ("unguarded-success", 1)]:
+            with self.subTest(behavior=behavior):
+                root = self.prepare(name=behavior, behavior=behavior)
+                self.assertEqual(coordinate.worker(root), expected_exit)
+                results = root / "results"
+                task = coordinate.read_json(root / "task.json")
+                receipt = coordinate.read_json(results / "worker-receipt.json")
+                native = coordinate.inspect_events(results / "pi-events.jsonl", 10, 10)
+                self.assertEqual(native["tool_calls"], 2)
+                if expected_exit == 0:
+                    verified = coordinate.verify_return(results, task, {"answer.txt": b"before\n"}, "run-one")
+                    self.assertEqual(verified["outcome"], "returned")
+                    self.assertEqual(verified["extension"]["tool_calls"], 1)
+                else:
+                    self.assertNotEqual(receipt["outcome"], "returned")
+
+    def test_host_rejects_resealed_invalid_extension_proof(self):
+        root = self.prepare()
+        self.assertEqual(coordinate.worker(root), 0)
+        pristine = root / "results"
+        task = coordinate.read_json(root / "task.json")
+        source = {"answer.txt": b"before\n"}
+        self.assertIn("extension", coordinate.verify_return(pristine, task, source, "run-one"))
+        for corruption in ["missing", "refused", "identity", "terminal", "counters", "receipt-summary"]:
+            with self.subTest(corruption=corruption):
+                results = root / corruption; shutil.copytree(pristine, results)
+                path = results / "extension-events.jsonl"
+                events = [json.loads(line) for line in path.read_text().splitlines()]
+                receipt = coordinate.read_json(results / "worker-receipt.json")
+                if corruption == "missing":
+                    path.unlink()
+                else:
+                    if corruption == "refused":
+                        denied = {**events[2], "type": "refused", "failure": {"code": "task_unavailable"}}
+                        events.insert(3, denied)
+                    elif corruption == "identity":
+                        events[1]["task_sha256"] = "0" * 64
+                    elif corruption == "terminal":
+                        events.pop()
+                    elif corruption == "counters":
+                        events[-1]["turns"] += 1
+                    elif corruption == "receipt-summary":
+                        receipt["extension"] = {"forged": True}
+                    path.write_text("".join(json.dumps(event) + "\n" for event in events))
+                receipt["artifact_sha256"] = {name: coordinate.digest(raw) for name, raw in coordinate.snapshot(results).items() if name != "worker-receipt.json"}
+                dump(results / "worker-receipt.json", receipt)
+                with self.assertRaises(ValueError):
+                    coordinate.verify_return(results, task, source, "run-one")
+
+    @unittest.skipUnless(shutil.which("node"), "Cross-layer fixture needs Node, as does the Pi extension")
+    def test_real_extension_refusal_blocks_otherwise_normal_pi_finish(self):
+        root = self.prepare()
+        adapter = root / "fake-pi.mjs"
+        extension_url = (SCRIPT.parent.parent / "extensions/coordination.js").as_uri()
+        adapter.write_text("import extension from " + json.dumps(extension_url) + ";\n" + r'''
+import fs from 'node:fs';
+const taskPath=process.argv[process.argv.indexOf('--coordination-task')+1];
+const task=JSON.parse(fs.readFileSync(taskPath,'utf8'));
+const handlers=new Map(), tools=new Map(); let active=[];
+const ctx={cwd:task.workspace,hasUI:false,abort(){},shutdown(){}};
+extension({registerFlag(){},getFlag:()=>taskPath,registerCommand(){},registerTool:t=>tools.set(t.name,t),on:(name,handler)=>handlers.set(name,handler),getActiveTools:()=>active,setActiveTools:n=>{active=n;}});
+const emit=async(name,event={})=>handlers.get(name)?.(event,ctx);
+await emit('session_start'); await emit('turn_start');
+const handoff={toolName:'coordination_handoff',toolCallId:'handoff-1',input:{status:'completed',summary:'Synthetic handoff',evidence:['answer.txt'],changed_files:[],limitations:[]}};
+await emit('tool_call',handoff); await tools.get(handoff.toolName).execute(handoff.toolCallId,handoff.input);
+const denied=await emit('tool_call',{toolName:'read',toolCallId:'late-read',input:{path:'answer.txt'}});
+if(!denied?.block) throw Error('Expected the actual extension to refuse a post-handoff tool');
+await emit('agent_settled'); await emit('session_shutdown');
+for(const event of [{type:'tool_execution_start',toolCallId:'handoff-1',toolName:'coordination_handoff'},{type:'tool_execution_end',toolCallId:'handoff-1',isError:false},{type:'tool_execution_start',toolCallId:'late-read',toolName:'read'},{type:'tool_execution_end',toolCallId:'late-read',isError:true},{type:'message_end',message:{role:'assistant',stopReason:'stop'}},{type:'agent_end'}]) console.log(JSON.stringify(event));
+''')
+        launch = coordinate.read_json(root / "launch.json")
+        launch["pi_argv"] = ["node", str(adapter)]; dump(root / "launch.json", launch)
+        self.assertEqual(coordinate.worker(root), 1)
+        receipt = coordinate.read_json(root / "results/worker-receipt.json")
+        self.assertEqual(receipt["pi_exit_code"], 0)
+        self.assertNotEqual(receipt["outcome"], "returned")
+        events = [json.loads(line) for line in (root / "results/extension-events.jsonl").read_text().splitlines()]
+        self.assertTrue(any(event["type"] == "refused" for event in events))
+        self.assertEqual(coordinate.inspect_events(root / "results/pi-events.jsonl", 10, 10)["tool_calls"], 2)
 
     def test_changed_source_and_check_mutation_are_refused(self):
         root = self.prepare(name="changed-before")

@@ -189,6 +189,7 @@ def inspect_events(path, max_tools, max_turns):
     if len(raw) > MAX_OUTPUT_BYTES:
         raise ValueError("Pi output exceeds limit")
     outstanding, seen, calls, turns, final_stop, ended = set(), set(), 0, 0, None, False
+    executions = {}
     for line in raw.splitlines():
         event = json.loads(line)
         kind, message = event.get("type"), event.get("message", {})
@@ -200,12 +201,14 @@ def inspect_events(path, max_tools, max_turns):
                 raise ValueError("Duplicate tool start")
             seen.add(call_id)
             outstanding.add(call_id)
+            executions[call_id] = {"id": call_id, "name": event.get("toolName")}
             calls += 1
         elif kind == "tool_execution_end":
             call_id = event["toolCallId"]
             if call_id not in outstanding:
                 raise ValueError("Unpaired tool result")
             outstanding.remove(call_id)
+            executions[call_id]["is_error"] = event.get("isError") is True
         elif kind == "message_end" and message.get("role") == "assistant":
             turns += 1
             final_stop = message.get("stopReason")
@@ -214,7 +217,46 @@ def inspect_events(path, max_tools, max_turns):
             ended = True
     if outstanding or not turns or not ended or final_stop != "stop" or calls > max_tools or turns > max_turns:
         raise ValueError("Pi output is incomplete or exceeded its budget")
-    return {"tool_calls": calls, "assistant_turns": turns, "event_log_sha256": digest(raw)}
+    return {"tool_calls": calls, "assistant_turns": turns, "event_log_sha256": digest(raw), "tool_executions": list(executions.values())}
+
+
+def inspect_extension_events(path, task, pi_events, task_sha256):
+    """A normal Pi exit cannot override a task guard refusal or missing handoff."""
+    path = Path(path)
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_OUTPUT_BYTES:
+        raise ValueError("Missing or oversized extension lifecycle log")
+    raw = path.read_bytes()
+    events = [json.loads(line) for line in raw.splitlines()]
+    if len(raw) > MAX_OUTPUT_BYTES or not events or any(not isinstance(event, dict) for event in events):
+        raise ValueError("Invalid extension lifecycle log")
+    kinds = [event.get("type") for event in events]
+    if kinds[0] != "task_loaded" or kinds.count("task_loaded") != 1 or kinds.count("handoff") != 1 or kinds.count("agent_settled") != 1 or kinds.count("session_shutdown") != 1 or kinds[-2:] != ["agent_settled", "session_shutdown"]:
+        raise ValueError("Incomplete or unordered extension lifecycle")
+    if set(kinds) - {"task_loaded", "tool_call", "handoff", "agent_settled", "session_shutdown"} or any(event.get("failure") for event in events):
+        raise ValueError("Extension refused the delegated task")
+    for event in events:
+        if event.get("run_id") != task["run_id"] or event.get("task_id") != task["task_id"] or event.get("task_sha256") != task_sha256:
+            raise ValueError("Extension lifecycle identity mismatch")
+    handoff_index = kinds.index("handoff")
+    if kinds[handoff_index + 1:] != ["agent_settled", "session_shutdown"] or events[handoff_index].get("reported_status") != "completed":
+        raise ValueError("Extension did not finish with a completed handoff")
+    calls = [event for event in events if event["type"] == "tool_call"]
+    if any(type(event.get("tool_calls")) is not int for event in calls) or [event.get("tool_calls") for event in calls] != list(range(1, len(calls) + 1)):
+        raise ValueError("Extension and Pi tool accounting differ")
+    guarded = {event.get("tool_call_id"): event.get("tool_name") for event in calls}
+    executed = {event["id"]: event for event in pi_events["tool_executions"]}
+    if len(guarded) != len(calls) or any(call_id not in executed or executed[call_id]["name"] != name for call_id, name in guarded.items()):
+        raise ValueError("Extension tool identities differ from Pi")
+    # Pi can reject malformed arguments before emitting the extension tool_call hook.
+    if any(not event["is_error"] for call_id, event in executed.items() if call_id not in guarded):
+        raise ValueError("Pi executed a tool without the extension guard")
+    for event in events[handoff_index:]:
+        if event.get("handed_off") is not True or type(event.get("tool_calls")) is not int or event["tool_calls"] != len(calls) or type(event.get("turns")) is not int:
+            raise ValueError("Extension terminal accounting differs from Pi")
+    # The final assistant response follows the handoff tool in a new turn.
+    if not 1 <= events[handoff_index]["turns"] <= pi_events["assistant_turns"] or any(event["turns"] != pi_events["assistant_turns"] for event in events[-2:]):
+        raise ValueError("Extension turn accounting differs from Pi")
+    return {"event_log_sha256": digest(raw), "model": events[0].get("model"), "tool_calls": len(calls), "assistant_turns": pi_events["assistant_turns"]}
 
 
 def worker(root):
@@ -237,6 +279,7 @@ def worker(root):
         if receipt["pi_exit_code"] != 0:
             raise ValueError("Pi exited unsuccessfully")
         receipt["events"] = inspect_events(output / "pi-events.jsonl", task["max_tool_calls"], task["max_turns"])
+        receipt["extension"] = inspect_extension_events(output / "extension-events.jsonl", task, receipt["events"], digest((root / "task.json").read_bytes()))
         report = read_json(output / "model-report.json")
         if report.get("run_id") != task["run_id"] or report.get("task_id") != task["task_id"] or report.get("model_self_report") is not True or report.get("task_sha256") != digest((root / "task.json").read_bytes()):
             raise ValueError("Model handoff identity mismatch")
@@ -309,6 +352,9 @@ def verify_return(results, task, source_files, run_id):
     events = inspect_events(results / "pi-events.jsonl", task["max_tool_calls"], task["max_turns"])
     if receipt.get("events") != events:
         raise ValueError("Recorded Pi events differ from returned log")
+    extension = inspect_extension_events(results / "extension-events.jsonl", task, events, digest(json.dumps(task).encode()))
+    if receipt.get("extension") != extension:
+        raise ValueError("Recorded extension lifecycle differs from returned log")
     checks = receipt.get("checks")
     if not isinstance(checks, list) or len(checks) != len(task["checks"]):
         raise ValueError("Missing declared check result")
