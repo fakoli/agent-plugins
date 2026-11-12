@@ -203,6 +203,53 @@ class ContractTests(unittest.TestCase):
             destination.unlink(); destination.symlink_to(source)
             with self.assertRaises(ValueError): coordinate.configure_profile(source, destination)
 
+    def test_profile_model_syntax_refuses_unusable_defaults_before_registration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.json"
+            profile = {"sandbox_name": "fixture", "sandbox_id": "exact-id", "pi_argv": ["pi"], "model": "example/model"}
+            for index, model in enumerate(["bad model", "example/bad model", "https://example.invalid/model", "unqualified", "a" * 257 + "/model", "example/" + "b" * 257, "a" * 10000, "example/model\n"]):
+                with self.subTest(model=model[:40]):
+                    dump(source, {**profile, "model": model})
+                    destination = root / str(index) / "profile.json"
+                    with self.assertRaises(ValueError): coordinate.configure_profile(source, destination)
+                    self.assertFalse(destination.parent.exists())
+                    with self.assertRaises(ValueError): coordinate.profile_settings(source)
+            for model in ["one/two/three", "provider/model:revision", "a" * 256 + "/" + "b" * 256, "a/" + "b" * 254 + "/c/" + "d" * 254]:
+                with self.subTest(valid_model=model[:40]):
+                    dump(source, {**profile, "model": model})
+                    self.assertEqual(coordinate.profile_settings(source), {**profile, "model": model})
+
+    def test_default_registration_compares_effective_defaults_without_rewriting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.json"
+            profile = {"sandbox_name": "fixture", "sandbox_id": "exact-id", "pi_argv": ["pi"], "model": "example/model"}
+            defaults = {"openshell_argv": ["openshell"], "python": "python3", "remote_parent": "/sandbox/codex-pi", "thinking": "high", "environment": {}, "protected_sandboxes": []}
+            cases = [{key: value} for key, value in defaults.items()] + [defaults]
+            for index, explicit in enumerate(cases):
+                for reverse in [False, True]:
+                    with self.subTest(explicit=explicit, reverse=reverse):
+                        initial, repeated = (profile, {**profile, **explicit}) if not reverse else ({**profile, **explicit}, profile)
+                        dump(source, initial)
+                        destination = root / f"{index}-{reverse}" / "profile.json"
+                        self.assertTrue(coordinate.configure_profile(source, destination)["changed"])
+                        before = (destination.read_bytes(), destination.stat().st_ino, destination.stat().st_mtime_ns)
+                        dump(source, repeated)
+                        self.assertFalse(coordinate.configure_profile(source, destination)["changed"])
+                        self.assertEqual((destination.read_bytes(), destination.stat().st_ino, destination.stat().st_mtime_ns), before)
+            for key, value in {"openshell_argv": ["different-owner"], "python": "different-python", "remote_parent": "/sandbox/different", "thinking": "low", "environment": {"PYTHONDONTWRITEBYTECODE": "1"}, "protected_sandboxes": ["other-sandbox"]}.items():
+                with self.subTest(conflict=key):
+                    dump(source, {**profile, key: value})
+                    with self.assertRaises(ValueError): coordinate.configure_profile(source, destination)
+                    self.assertEqual(destination.read_bytes(), before[0])
+            dump(source, profile)
+            destination.chmod(0o644)
+            with self.assertRaises(ValueError): coordinate.configure_profile(source, destination)
+            destination.chmod(0o600); destination.parent.chmod(0o755)
+            with self.assertRaises(ValueError): coordinate.configure_profile(source, destination)
+            self.assertEqual(destination.read_bytes(), before[0])
+
     def test_malformed_tasks_fail_as_validation_errors(self):
         bad_fields = [("version", True), ("kind", []), ("task_id", "../escape"),
                       ("instructions", ""), ("writable_paths", ["."]),

@@ -33,6 +33,7 @@ MAX_FILES = 10000
 KINDS = {"implementation", "research", "review", "validation"}
 TOOLS = {"read", "grep", "find", "ls", "write", "edit"}
 THINKING_LEVELS = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
+MODEL_IDENTIFIER_PATTERN = r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}"
 PLUGIN = Path(__file__).resolve().parents[1]
 
 
@@ -114,7 +115,7 @@ def validate_task(task):
 
 
 def model_identifier(value):
-    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}", value) or "://" in value:
+    if not isinstance(value, str) or not re.fullmatch(MODEL_IDENTIFIER_PATTERN, value) or "://" in value:
         raise ValueError("Expected a bounded model identifier, not a URL or command")
     return value
 
@@ -865,6 +866,10 @@ def profile_settings(path):
     for key in required - {"pi_argv"}:
         if not isinstance(profile[key], str) or not profile[key] or profile[key].startswith("-"):
             raise ValueError("Invalid profile " + key)
+    # Validate a qualified spelling without choosing a slash boundary. Exact
+    # provider/model selection still requires an unambiguous runtime catalog.
+    if not re.fullmatch(f"{MODEL_IDENTIFIER_PATTERN}/{MODEL_IDENTIFIER_PATTERN}", profile["model"]) or "://" in profile["model"]:
+        raise ValueError("Profile model must be a bounded provider/model identifier")
     for key, default in (("pi_argv", []), ("openshell_argv", ["openshell"])):
         value = profile.get(key, default)
         if not isinstance(value, list) or not value or any(not isinstance(s, str) or not s or "\x00" in s for s in value):
@@ -887,6 +892,11 @@ def profile_settings(path):
     return profile
 
 
+def effective_profile_settings(profile):
+    return {"openshell_argv": ["openshell"], "python": "python3", "remote_parent": "/sandbox/codex-pi",
+            "thinking": "high", "environment": {}, "protected_sandboxes": [], **profile}
+
+
 def configure_profile(source, destination=None):
     """Register private settings without overwriting another default or provider."""
     profile = profile_settings(source)
@@ -907,7 +917,7 @@ def configure_profile(source, destination=None):
         raise ValueError("Default profile directory must be owned and private (0700)")
     if destination.exists():
         current = destination.stat()
-        if current.st_uid != os.getuid() or stat.S_IMODE(current.st_mode) != 0o600 or profile_settings(destination) != profile:
+        if current.st_uid != os.getuid() or stat.S_IMODE(current.st_mode) != 0o600 or effective_profile_settings(profile_settings(destination)) != effective_profile_settings(profile):
             raise ValueError("Existing default profile differs or is not private; preserved")
         return {"configured": True, "changed": False, "runtime_verified": False}
     descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
