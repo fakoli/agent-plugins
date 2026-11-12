@@ -857,7 +857,7 @@ def verify_changes(results, actual, task, source_files, receipt, report):
         raise ValueError("Returned patch/files differ from the verified change manifest")
 
 
-def profile_settings(path):
+def profile_settings(path, *, require_qualified_model=False):
     profile = read_json(path)
     required = {"sandbox_name", "sandbox_id", "pi_argv", "model"}
     optional = {"openshell_argv", "python", "remote_parent", "thinking", "environment", "protected_sandboxes"}
@@ -866,9 +866,10 @@ def profile_settings(path):
     for key in required - {"pi_argv"}:
         if not isinstance(profile[key], str) or not profile[key] or profile[key].startswith("-"):
             raise ValueError("Invalid profile " + key)
-    # Validate a qualified spelling without choosing a slash boundary. Exact
-    # provider/model selection still requires an unambiguous runtime catalog.
-    if not re.fullmatch(f"{MODEL_IDENTIFIER_PATTERN}/{MODEL_IDENTIFIER_PATTERN}", profile["model"]) or "://" in profile["model"]:
+    # New defaults/runs need qualified syntax without choosing a slash boundary.
+    # Recovery/reconcile preserve legacy selectors without executing model work.
+    # Exact provider/model selection still requires an unambiguous runtime catalog.
+    if require_qualified_model and (not re.fullmatch(f"{MODEL_IDENTIFIER_PATTERN}/{MODEL_IDENTIFIER_PATTERN}", profile["model"]) or "://" in profile["model"]):
         raise ValueError("Profile model must be a bounded provider/model identifier")
     for key, default in (("pi_argv", []), ("openshell_argv", ["openshell"])):
         value = profile.get(key, default)
@@ -899,7 +900,7 @@ def effective_profile_settings(profile):
 
 def configure_profile(source, destination=None):
     """Register private settings without overwriting another default or provider."""
-    profile = profile_settings(source)
+    profile = profile_settings(source, require_qualified_model=True)
     destination = Path(destination) if destination is not None else Path.home() / ".config/codex-pi-coordination/profile.json"
     destination = destination.absolute()
     for path in (destination, *destination.parents):
@@ -1012,7 +1013,7 @@ def cleanup_owner(owner, profile, receipt, protected):
 
 def run_task(task_file, profile_file, output, lock_root, *, capabilities_only=False):
     task = validate_task({"version": 2, "task_id": "capabilities", "kind": "validation", "instructions": "Inspect configured runtime metadata without model work.", "writable_paths": [], "checks": [], "wall_seconds": 30} if capabilities_only else read_json(task_file))
-    profile = profile_settings(profile_file)
+    profile = profile_settings(profile_file, require_qualified_model=True)
     files, source = frozen_source(task)
     output = Path(output).absolute()
     output.mkdir(parents=True, exist_ok=False)

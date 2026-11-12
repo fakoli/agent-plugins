@@ -208,17 +208,24 @@ class ContractTests(unittest.TestCase):
             root = Path(directory)
             source = root / "source.json"
             profile = {"sandbox_name": "fixture", "sandbox_id": "exact-id", "pi_argv": ["pi"], "model": "example/model"}
+            task_file = root / "task.json"; dump(task_file, task_template())
             for index, model in enumerate(["bad model", "example/bad model", "https://example.invalid/model", "unqualified", "a" * 257 + "/model", "example/" + "b" * 257, "a" * 10000, "example/model\n"]):
                 with self.subTest(model=model[:40]):
                     dump(source, {**profile, "model": model})
                     destination = root / str(index) / "profile.json"
                     with self.assertRaises(ValueError): coordinate.configure_profile(source, destination)
                     self.assertFalse(destination.parent.exists())
-                    with self.assertRaises(ValueError): coordinate.profile_settings(source)
+                    with self.assertRaises(ValueError): coordinate.profile_settings(source, require_qualified_model=True)
+                    self.assertEqual(coordinate.profile_settings(source)["model"], model)
+                    output = root / f"run-{index}"
+                    with mock.patch.object(coordinate, "OpenShellOwner") as owner, contextlib.redirect_stderr(io.StringIO()):
+                        self.assertEqual(coordinate.main(["run", str(task_file), "--profile", str(source), "--output", str(output)]), 1)
+                        owner.assert_not_called()
+                    self.assertFalse(output.exists())
             for model in ["one/two/three", "provider/model:revision", "a" * 256 + "/" + "b" * 256, "a/" + "b" * 254 + "/c/" + "d" * 254]:
                 with self.subTest(valid_model=model[:40]):
                     dump(source, {**profile, "model": model})
-                    self.assertEqual(coordinate.profile_settings(source), {**profile, "model": model})
+                    self.assertEqual(coordinate.profile_settings(source, require_qualified_model=True), {**profile, "model": model})
 
     def test_default_registration_compares_effective_defaults_without_rewriting(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1115,6 +1122,47 @@ class RecoveryTests(unittest.TestCase):
     def recover(self, mode='normal', output='recovered'):
         with mock.patch.object(coordinate, 'OpenShellOwner', self.recovery_factory(mode)):
             return coordinate.recover_task(self.root / 'out', self.profile_path, self.root / output, self.root / 'locks')
+
+    def test_legacy_bare_model_profile_reconciles_and_recovers_v1_without_execution(self):
+        for index, model in enumerate(["llm.primary", "sonnet:high"]):
+            with self.subTest(model=model):
+                self.profile["model"] = model; dump(self.profile_path, self.profile)
+                run_id = format(index + 1, "032x")
+                remote = Path(self.profile["remote_parent"]) / run_id
+                results = remote / "results"; results.mkdir(parents=True)
+                source = {"kind": "empty-workspace", "files": {}, "modes": {}}
+                check = {"name": "never-run", "argv": [sys.executable, "-c", "raise AssertionError('Recovery cannot execute checks')"], "timeout_seconds": 2}
+                native = {"version": 1, "run_id": run_id, "task_id": "legacy-task", "kind": "validation", "instructions": "Retained legacy task", "workspace": str(remote / "workspace"), "output_directory": str(results), "writable_paths": [], "allowed_tools": sorted(coordinate.TOOLS - {"write", "edit"}), "max_tool_calls": 10, "max_turns": 10, "source": source, "checks": [check]}
+                launch = {"model": model, "thinking": "high", "checks": [check]}
+                payload = {"task.json": json.dumps(native).encode(), "launch.json": json.dumps(launch).encode(), "coordinate.py": b"# retained v1 worker", "extension.js": b"// retained v1 extension", "package.json": b'{"type":"module"}'}
+                archive = make_archive([(name, raw, tarfile.REGTYPE) for name, raw in payload.items()])
+                failed = self.root / f"legacy-{index}"; failed.mkdir()
+                (failed / "inputs.tar").write_bytes(archive)
+                stopped = {"id": "sandbox-id", "name": "disposable", "phase": "Stopped", "main_process_instance_id": "legacy-main", "restart_count": 0}
+                original = {"version": 1, "run_id": run_id, "task_id": "legacy-task", "kind": "validation", "started_at": "2000-01-01T00:00:00Z", "source": source, "input_sha256": coordinate.digest(archive), "remote_artifacts": str(results), "delivery_valid": False, "cleanup_complete": False, "sandbox_running": {**stopped, "phase": "Ready"}, "sandbox_after": stopped}
+                dump(failed / "started.json", original); dump(failed / "receipt.json", original)
+                dump(results / "worker-receipt.json", {"version": 1, "run_id": run_id, "task_id": "legacy-task", "outcome": "incomplete", "pi_exit_code": 7})
+                locks = self.root / "locks"; locks.mkdir(exist_ok=True)
+                journal = locks / (coordinate.digest(b"sandbox-id") + ".json"); dump(journal, original)
+                preserved = {path: path.read_bytes() for path in [self.profile_path, failed / "started.json", failed / "receipt.json", failed / "inputs.tar"]}
+                reconcile = ["reconcile", "--profile", str(self.profile_path), "--lock-root", str(locks)]
+                before = journal.read_bytes()
+                with mock.patch.object(coordinate, "OpenShellOwner", self.recovery_factory("initial-wrong-main")), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(coordinate.main(reconcile), 1)
+                self.assertEqual(journal.read_bytes(), before)
+                with mock.patch.object(coordinate, "OpenShellOwner", self.recovery_factory()), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(coordinate.main(reconcile), 0)
+                self.assertEqual(self.instances[-1].calls, [])
+                output = self.root / f"recovered-legacy-{index}"
+                with mock.patch.object(coordinate, "OpenShellOwner", self.recovery_factory()), mock.patch.object(coordinate, "execute_to_log", side_effect=AssertionError("Recovery cannot run Pi or checks")), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(coordinate.main(["recover", str(failed), "--profile", str(self.profile_path), "--output", str(output), "--lock-root", str(locks)]), 0)
+                recovered = coordinate.read_json(output / "receipt.json")
+                self.assertTrue(recovered["recovery_valid"])
+                self.assertFalse(recovered["delivery_valid"]); self.assertFalse(recovered["task_delivery_valid"])
+                self.assertEqual(recovered["outcome"], "recovered_partial")
+                self.assertEqual(recovered["evidence"]["checks"], [{"name": "never-run", "state": "unknown", "exit_code": None}])
+                self.assertEqual(self.instances[-1].calls, ["start", "download", "stop"])
+                self.assertEqual(preserved, {path: path.read_bytes() for path in preserved})
 
     def test_nonzero_check_recovers_without_reexecution_or_task_success(self):
         original = self.failed_run()
