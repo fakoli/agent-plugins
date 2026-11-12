@@ -1,6 +1,6 @@
 ---
 name: codex-pi-coordination
-description: Delegate scoped implementation, research, review or validation from Codex to Pi in a caller-owned NVIDIA OpenShell sandbox, then inspect returned artifacts, actual checks and managed cleanup. Use for Codex-Pi collaboration or Pi/GLM assistance; model selection and acceptance remain with the coordinator.
+description: Delegate scoped implementation, research, review or validation from Codex to Pi in a caller-owned NVIDIA OpenShell sandbox, inspect returned work, or recover the latest stopped failed run without rerunning it. Use for Codex-Pi collaboration or Pi/GLM assistance; model selection and acceptance remain with the coordinator.
 ---
 
 # Codex and Pi coordination
@@ -50,10 +50,21 @@ actual changes, exit codes and artifact hashes. Pi's handoff is a self-report.
 no acceptance, merge, deployment or proof of research truth.
 
 On a failed/nonzero OpenShell run or timeout, the runner immediately requests a
-managed stop and skips downloading artifacts. Read `remote_artifacts` in
-`receipt.json` for retained sandbox evidence; recovery belongs to the runtime
-owner after stopped custody is confirmed. Never download while failed work may
-still be active.
+managed stop and skips downloading artifacts. After confirmed stopped custody,
+recover the latest failed run with its original profile and shared lock root:
+
+```sh
+python3 ../../scripts/coordinate.py recover /private/evidence/failed-run --output /private/evidence/recovery
+```
+
+The runtime owner must have qualified the sandbox entrypoint as idle on restart.
+Recovery starts a fresh idle main instance, downloads only the bound prior
+results, and stops it. It never launches Pi, a worker or verification checks.
+Inspect the separate recovery receipt and evidence status. `recovery_valid` and
+CLI exit zero mean retrieval and available bindings passed with stopped cleanup;
+task delivery stays invalid. `recovered_partial` leaves absent check exits and
+worker outcomes unknown. Preserve contradictory artifacts as a failed integrity
+gate. Never rewrite a failed receipt to use the successful-return verifier.
 
 Require confirmed managed stop and unchanged protected resources. An exec
 timeout does not prove remote termination. Unknown custody blocks another run.

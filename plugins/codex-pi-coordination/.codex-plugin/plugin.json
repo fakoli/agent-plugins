@@ -1,6 +1,6 @@
 {
   "name": "codex-pi-coordination",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Coordinate bounded implementation, research, review and validation tasks between Codex and Pi inside NVIDIA OpenShell.",
   "author": {
     "name": "Fakoli",

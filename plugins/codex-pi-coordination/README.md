@@ -30,9 +30,21 @@ operator profiles/evidence outside public plugin source.
 
 On execution failure, nonzero worker exit or timeout, the runner immediately
 enters managed OpenShell cleanup: verify identity, stop and record the readback.
-It skips artifact download;
-`receipt.json` retains the remote artifact path for the runtime owner to recover
-after confirming stopped custody. An unknown stop blocks another run.
+It skips artifact download. Recover the latest failed run after confirmed stopped
+custody using the same private profile and lock root:
+
+```sh
+python3 scripts/coordinate.py recover /private/evidence/failed-run --output /private/evidence/recovery
+```
+
+Recovery starts a fresh idle instance of the exclusively owned sandbox, downloads
+the bound results, and stops that instance. It runs no model or checks.
+`recovery_valid` means retrieval, available evidence bindings and cleanup passed;
+`recovered_partial` preserves missing terminal results as unknown. Task delivery
+remains invalid and acceptance is not granted. Unknown stop blocks further work
+until supported `reconcile`; the original failed receipt is never rewritten.
+The native download has a timeout and post-download file/byte checks, not a hard
+pre-download storage quota. Use only an owner-qualified idle runtime.
 
 Development checks:
 
