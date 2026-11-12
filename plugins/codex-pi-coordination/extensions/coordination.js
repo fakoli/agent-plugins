@@ -77,9 +77,13 @@ export function loadTask(taskPath, cwd) {
   if (task.version === 2) {
     const options = task.run_options;
     const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-    const identifier = (value) => typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}$/.test(value) && !value.includes("://");
+    const identifierPattern = "[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}";
+    const matchesIdentifier = (value, pattern) => typeof value === "string" && !value.includes("://") && new RegExp(`^${pattern}$`).exec(value)?.[0] === value;
+    const identifier = (value) => matchesIdentifier(value, identifierPattern);
+    // Each component may contain slashes; only the exact runtime catalog picks a pair.
+    const qualifiedDefault = (value) => matchesIdentifier(value, `${identifierPattern}/${identifierPattern}`);
     if (!options || typeof options !== "object" || Array.isArray(options) || Object.keys(options).some((key) => !["provider", "model", "thinking"].includes(key)) || (("provider" in options) !== ("model" in options)) || ("provider" in options && (!identifier(options.provider) || !identifier(options.model))) || ("thinking" in options && !levels.includes(options.thinking))) fail("invalid_task", "Invalid version 2 run options");
-    if (task.operation !== "run" || !task.runtime_defaults || Object.keys(task.runtime_defaults).sort().join(",") !== "model,thinking" || !identifier(task.runtime_defaults.model) || !levels.includes(task.runtime_defaults.thinking)) fail("invalid_task", "Invalid version 2 runtime defaults");
+    if (task.operation !== "run" || !task.runtime_defaults || Object.keys(task.runtime_defaults).sort().join(",") !== "model,thinking" || !qualifiedDefault(task.runtime_defaults.model) || !levels.includes(task.runtime_defaults.thinking)) fail("invalid_task", "Invalid version 2 runtime defaults");
   }
   boundedString(task.instructions, "instructions", 48000);
   for (const key of ["workspace", "output_directory"]) {

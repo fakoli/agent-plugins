@@ -102,6 +102,33 @@ test("explicit provider and model identifiers remain separate across slash bound
   }
 });
 
+test("qualified defaults load and reach the pre-prompt guard at both component bounds", async (t) => {
+  for (const [provider, id] of [["fixture-provider", "fixture-model"], ["p", "m".repeat(255)], ["p".repeat(256), "m".repeat(256)], ["a/" + "b".repeat(254), "c/" + "d".repeat(254)]]) {
+    const f = fixture(t, { version: 2, operation: "run", run_options: {}, runtime_defaults: { model: `${provider}/${id}`, thinking: "high" } });
+    assert.equal(loadTask(f.taskPath, f.workspace).task.runtime_defaults.model, `${provider}/${id}`);
+    const r = runtime(f.taskPath, f.workspace);
+    r.ctx.model = { provider, id };
+    await r.emit("session_start");
+    assert.ok((await r.emit("before_agent_start", { systemPrompt: "original" })).systemPrompt);
+    assert.equal(r.ctx.aborted, 0);
+    assert.deepEqual(events(f).at(-1).configuration, { provider, model: id, thinking: "high" });
+    await r.emit("session_shutdown");
+  }
+});
+
+test("qualified defaults reject malformed or overlong components without relaxing explicit options", (t) => {
+  const base = { version: 2, operation: "run", run_options: {}, runtime_defaults: { model: "p/m", thinking: "high" } };
+  for (const model of [null, "", "bare", "p/", "/m", "_p/m", "p/_m", "https://example/model", "p/m\n", "p/m\r\n", "p/bad model", "p".repeat(257) + "/m", "p/" + "m".repeat(257), "p".repeat(256) + "/" + "m".repeat(257)]) {
+    const f = fixture(t, { ...base, runtime_defaults: { model, thinking: "high" } });
+    assert.throws(() => loadTask(f.taskPath, f.workspace), /runtime defaults/);
+    assert.deepEqual(fs.readdirSync(f.output), []);
+  }
+  for (const run_options of [{ provider: "p".repeat(257), model: "m" }, { provider: "p", model: "m".repeat(257) }, { provider: "p\n", model: "m" }, { provider: "p", model: "m\n" }]) {
+    const f = fixture(t, { ...base, run_options });
+    assert.throws(() => loadTask(f.taskPath, f.workspace), /run options/);
+  }
+});
+
 test("each task kind injects context and returns a bound self-report without acceptance", async (t) => {
   for (const kind of ["implementation", "research", "review", "validation"]) {
     await t.test(kind, async (t) => {

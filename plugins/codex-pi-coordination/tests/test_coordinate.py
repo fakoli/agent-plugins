@@ -227,6 +227,47 @@ class ContractTests(unittest.TestCase):
                     dump(source, {**profile, "model": model})
                     self.assertEqual(coordinate.profile_settings(source, require_qualified_model=True), {**profile, "model": model})
 
+    def test_python_qualified_defaults_match_actual_extension_loading(self):
+        valid_pairs = [("p", "m"), ("p", "m" * 255), ("p" * 256, "m" * 256), ("a/" + "b" * 254, "c/" + "d" * 254)]
+        invalid_models = ["bare", "p/", "/m", "_p/m", "p/_m", "https://example/model", "p/m\n", "p/m\r\n", "p/bad model", "p" * 257 + "/m", "p/" + "m" * 257, "p" * 256 + "/" + "m" * 257]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"; workspace.mkdir()
+            output = root / "results"; output.mkdir()
+            source = root / "profile.json"
+            cases = []
+            for index, (model, pair) in enumerate([(provider + "/" + model, (provider, model)) for provider, model in valid_pairs] + [(model, None) for model in invalid_models]):
+                profile = {"sandbox_name": "fixture", "sandbox_id": "exact-id", "pi_argv": ["pi"], "model": model}
+                dump(source, profile)
+                destination = root / f"default-{index}" / "profile.json"
+                if pair:
+                    self.assertTrue(coordinate.configure_profile(source, destination)["changed"])
+                    defaults = {"model": coordinate.profile_settings(destination, require_qualified_model=True)["model"], "thinking": "high"}
+                    self.assertEqual(coordinate.desired_configuration({"run_options": {}, "runtime_defaults": defaults}, [{"provider": pair[0], "id": pair[1]}]), {"provider": pair[0], "model": pair[1], "thinking": "high"})
+                else:
+                    with self.assertRaises(ValueError): coordinate.configure_profile(source, destination)
+                    self.assertFalse(destination.parent.exists())
+                    defaults = {"model": model, "thinking": "high"}
+                task_path = root / f"task-{index}.json"
+                dump(task_path, {**task_template(), "version": 2, "run_id": "run-one", "operation": "run", "run_options": {}, "runtime_defaults": defaults, "workspace": str(workspace), "output_directory": str(output), "allowed_tools": ["read"], "max_tool_calls": 8})
+                cases.append({"task": str(task_path), "cwd": str(workspace), "expected": pair is not None})
+            # Use the actual native loader on Python-configured defaults, without
+            # Pi, an owner, a prompt or a duplicated JavaScript predicate.
+            program = """import fs from 'node:fs';
+const {loadTask} = await import(process.argv[1]);
+const cases = JSON.parse(fs.readFileSync(0, 'utf8'));
+console.log(JSON.stringify(cases.map(item => { try { loadTask(item.task, item.cwd); return true; } catch { return false; } })));
+"""
+            result = subprocess.run(["node", "--input-type=module", "-e", program, (SCRIPT.parent.parent / "extensions/coordination.js").as_uri()], input=json.dumps(cases), text=True, capture_output=True, timeout=10, check=True)
+            self.assertEqual(json.loads(result.stdout), [case["expected"] for case in cases])
+            self.assertEqual(list(output.iterdir()), [])
+            ambiguous = [{"provider": "one/two", "id": "three"}, {"provider": "one", "id": "two/three"}]
+            selection = {"run_options": {}, "runtime_defaults": {"model": "one/two/three", "thinking": "high"}}
+            with self.assertRaisesRegex(ValueError, "ambiguous"):
+                coordinate.desired_configuration(selection, ambiguous)
+            selection["run_options"] = {"provider": "one/two", "model": "three"}
+            self.assertEqual(coordinate.desired_configuration(selection, ambiguous), {"provider": "one/two", "model": "three", "thinking": "high"})
+
     def test_default_registration_compares_effective_defaults_without_rewriting(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
