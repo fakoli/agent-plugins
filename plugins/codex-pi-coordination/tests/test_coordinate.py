@@ -500,6 +500,7 @@ class OwnerTests(unittest.TestCase):
             def command(self, *args, timeout=60):
                 self.calls.append(args[0])
                 if args[0] == "start":
+                    if mode == "start-no-change-error": raise subprocess.CalledProcessError(1, "synthetic unchanged start")
                     self.state.update(phase="Ready", main_process_instance_id="new-main")
                     if mode == "start-error": raise subprocess.CalledProcessError(1, "synthetic start")
                 elif args[0] == "upload":
@@ -551,14 +552,27 @@ class OwnerTests(unittest.TestCase):
         self.assertEqual(self.instances[-1].calls.count("stop"), 1)
         self.assertEqual(receipt["acceptance"], "not_granted")
 
-    def test_failed_start_or_exec_stops_exact_owned_sandbox(self):
-        for mode in ["start-error", "exec-error"]:
-            with self.subTest(mode=mode):
-                receipt = self.run_fake(mode, mode)
-                self.assertFalse(receipt["delivery_valid"])
-                self.assertTrue(receipt["cleanup_complete"])
-                self.assertEqual(self.instances[-1].calls.count("stop"), 1)
-                self.assertNotIn("download", self.instances[-1].calls)
+    def test_failed_exec_stops_exact_owned_sandbox(self):
+        receipt = self.run_fake("exec-error")
+        self.assertFalse(receipt["delivery_valid"])
+        self.assertTrue(receipt["cleanup_complete"])
+        self.assertEqual(self.instances[-1].calls.count("stop"), 1)
+        self.assertNotIn("download", self.instances[-1].calls)
+
+    def test_failed_start_with_unbound_changed_main_never_stops_it(self):
+        receipt = self.run_fake("start-error")
+        self.assertFalse(receipt["delivery_valid"])
+        self.assertFalse(receipt["cleanup_complete"])
+        self.assertEqual(self.instances[-1].calls, ["start"])
+        self.assertEqual(self.instances[-1].main_instance, "old")
+        with self.assertRaises(ValueError): self.run_fake(name="blocked-next")
+
+    def test_failed_start_that_keeps_exact_stopped_state_needs_no_stop(self):
+        receipt = self.run_fake("start-no-change-error")
+        self.assertFalse(receipt["delivery_valid"])
+        self.assertTrue(receipt["cleanup_complete"])
+        self.assertEqual(self.instances[-1].calls, ["start"])
+        self.assertEqual(receipt["sandbox_before"], receipt["sandbox_after"])
 
     def test_failed_worker_stops_without_attempting_download(self):
         self.profile["pi_argv"][-1] = "exit-seven"; dump(self.profile_path, self.profile)

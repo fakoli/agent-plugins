@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One bounded Pi delegation in an exclusively owned OpenShell sandbox.
+"""Bounded Pi delegation and stopped-run evidence recovery in owned OpenShell.
 
 The model returns work; this command never applies patches or grants acceptance.
 OpenShell owns remote cleanup. No process-group-to-PID fallback is implemented.
@@ -467,15 +467,30 @@ def exclusive_owner(profile, lock_root):
         yield lock_root / (key + ".json")
 
 
-def cleanup_owner(owner, profile, receipt, protected, *, require_started_instance=False):
-    """Stop only the bound owned instance and retain uncertain cleanup."""
+def start_owned_instance(owner, profile, receipt, save_journal):
+    """Bind only a fresh Ready main observed after a successful start RPC."""
+    admitted_main = receipt["sandbox_before"]["main_process_instance_id"]
+    owner.main_instance = admitted_main
+    owner.command("start", profile["sandbox_name"])
+    state = owner.get()
+    if state.get("id") != profile["sandbox_id"]:
+        raise ValueError("Sandbox ownership identity changed after start")
+    if state["phase"] != "Ready" or not state.get("main_process_instance_id") or state["main_process_instance_id"] == admitted_main:
+        raise ValueError("Start requires a fresh Ready main instance")
+    owner.main_instance = state["main_process_instance_id"]
+    receipt["sandbox_running"] = selected_state(state)
+    save_journal()
+
+
+def cleanup_owner(owner, profile, receipt, protected):
+    """Stop only the bound fresh instance and retain uncertain cleanup."""
     try:
         state = owner.verify()
-        if not require_started_instance or "sandbox_running" in receipt:
+        if "sandbox_running" in receipt:
             owner.command("stop", profile["sandbox_name"])
             state = owner.verify()
-        elif state["phase"] != "Stopped":
-            raise ValueError("Fresh recovery instance was not bound; refusing stop")
+        elif selected_state(state) != receipt["sandbox_before"]:
+            raise ValueError("Fresh instance was not bound; refusing stop")
         receipt["sandbox_after"] = selected_state(state)
         receipt["cleanup_complete"] = state["phase"] == "Stopped"
     except BaseException as error:
@@ -531,13 +546,7 @@ def run_task(task_file, profile_file, output, lock_root):
         for sig in (signal.SIGINT, signal.SIGTERM):
             previous_handlers[sig] = signal.signal(sig, interrupted)
         try:
-            owner.command("start", profile["sandbox_name"])
-            state = owner.verify()
-            if state["phase"] != "Ready" or not state.get("main_process_instance_id"):
-                raise ValueError("Started sandbox is not Ready with a main instance")
-            owner.main_instance = state["main_process_instance_id"]
-            receipt["sandbox_running"] = selected_state(state)
-            save_journal()
+            start_owned_instance(owner, profile, receipt, save_journal)
             owner.command("upload", "--no-git-ignore", profile["sandbox_name"], str(archive_path), remote_archive)
             bootstrap = """import pathlib,tarfile,hashlib,sys
 p=pathlib.Path(sys.argv[1]); r=pathlib.Path(sys.argv[2])
@@ -782,19 +791,8 @@ def recover_task(failed_directory, profile_file, output, lock_root):
             raise KeyboardInterrupt("Owner cancellation requested")
         for sig in (signal.SIGINT, signal.SIGTERM):
             previous_handlers[sig] = signal.signal(sig, interrupted)
-        owner.main_instance = stopped["main_process_instance_id"]
         try:
-            owner.command("start", profile["sandbox_name"])
-            # A failed start RPC leaves only the old instance attributable. Do not
-            # stop an unobserved replacement; unresolved custody requires reconciliation.
-            state = owner.get()
-            if state.get("id") != profile["sandbox_id"]:
-                raise ValueError("Sandbox ownership identity changed after start")
-            if state["phase"] != "Ready" or not state.get("main_process_instance_id") or state["main_process_instance_id"] == stopped["main_process_instance_id"]:
-                raise ValueError("Recovery requires a fresh Ready idle main instance")
-            owner.main_instance = state["main_process_instance_id"]
-            receipt["sandbox_running"] = selected_state(state)
-            save_journal()
+            start_owned_instance(owner, profile, receipt, save_journal)
             owner.verify()
             owner.command("download", profile["sandbox_name"], receipt["remote_artifacts"], str(output / "results"))
             receipt["download_complete"] = True
@@ -805,7 +803,7 @@ def recover_task(failed_directory, profile_file, output, lock_root):
         finally:
             for sig in previous_handlers:
                 signal.signal(sig, signal.SIG_IGN)
-            cleanup_owner(owner, profile, receipt, protected, require_started_instance=True)
+            cleanup_owner(owner, profile, receipt, protected)
             receipt["ended_at"] = utc_now()
             receipt["recovery_valid"] = receipt["cleanup_complete"] and receipt.get("protected_unchanged", False) and receipt.get("download_complete", False) and receipt.get("evidence", {}).get("available_bindings_valid", False)
             save_journal()

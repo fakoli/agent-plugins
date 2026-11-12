@@ -123,7 +123,7 @@ cleanup may be recovered after reconciliation; an already-valid delivery may not
 The owner must qualify the existing sandbox entrypoint as idle on restart. The
 runner starts a fresh Ready main instance and performs only a native download,
 then verifies its identity, stops it and reads back protected resources. It does
-not upload, exec, rerun Pi or rerun checks. If a start fails before the fresh
+not upload, exec, rerun Pi or rerun checks. For both normal runs and recovery, if a start fails before the fresh
 instance is bound, an unexpected main is not stopped; custody remains unresolved.
 Unknown cleanup blocks another run until supported Stopped reconciliation. A
 retry retains the original failed-run identity even after recovery reconciliation.
