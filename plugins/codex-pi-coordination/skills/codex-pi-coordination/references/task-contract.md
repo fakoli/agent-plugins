@@ -135,6 +135,13 @@ or wrong response IDs fail. Stderr remains bounded and separate from protocol.
 Full model objects are not retained; control evidence allowlists identity, level
 and state fields before persistence.
 
+Pi can emit `thinking_level_changed` before acknowledging a model or thinking
+setter. The runner retains only its level and binds the event to that one
+outstanding setter. Unsolicited, repeated, malformed or mismatched configuration
+events refuse; other pre-prompt agent/tool/UI activity remains forbidden. The
+returned transcript must preserve this ordering and agree with effective-state
+readback. A same-value setter needs no change event.
+
 After one valid handoff, require `agent_settled` and an idle/empty-queue readback.
 The runner closes stdin for orderly shutdown and requires child exit and
 extension shutdown before executing checks. Prompt acknowledgement or

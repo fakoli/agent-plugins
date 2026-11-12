@@ -333,11 +333,24 @@ def rpc_data(command, data):
     raise ValueError("Unexpected RPC command")
 
 
+def configuration_event_record(value, request_id, command, arguments, previous_level):
+    """Accept only the native, changing-level event of one authorized setter."""
+    level = value.get("level")
+    if value.get("type") != "thinking_level_changed" or not isinstance(level, str) or level not in THINKING_LEVELS or level == previous_level or command not in {"set_model", "set_thinking_level"}:
+        raise ValueError("Unexpected or malformed RPC configuration event")
+    if command == "set_thinking_level" and arguments.get("level") != level:
+        raise ValueError("RPC thinking event differs from the requested selection")
+    return {"type": "configuration_event", "id": request_id, "command": command,
+            "event": "thinking_level_changed", "level": level}
+
+
 class PiRpc:
     """One bounded stdlib RPC child; OpenShell remains its lifecycle owner."""
     def __init__(self, command, workspace, output, deadline, env):
         self.deadline, self.output = deadline, output
         self.pending, self.responses, self.records = {}, {}, []
+        self.pending_arguments, self.configuration_events = {}, set()
+        self.observed_thinking = None
         self.sequence, self.bytes_seen, self.settled = 0, 0, 0
         self.prompt_sent, self.stdin_closed = False, False
         self.buffer, self.outgoing = b"", b""
@@ -368,6 +381,7 @@ class PiRpc:
                 raise ValueError("A run permits exactly one prompt")
             self.prompt_sent = True
         self.pending[request_id] = command
+        self.pending_arguments[request_id] = arguments
         retained = {"message_sha256": digest(arguments["message"].encode())} if command == "prompt" else arguments
         self.record({"type": "request", "id": request_id, "command": command, "arguments": retained})
         self.outgoing += (json.dumps({"id": request_id, "type": command, **arguments}) + "\n").encode()
@@ -389,12 +403,30 @@ class PiRpc:
             if not isinstance(request_id, str) or request_id not in self.pending or value.get("command") != self.pending[request_id]:
                 raise ValueError("Unmatched or duplicate RPC response")
             command = self.pending.pop(request_id)
+            arguments = self.pending_arguments.pop(request_id)
             if value.get("success") is not True:
                 self.record({"type": "response", "id": request_id, "command": command, "success": False})
                 raise ValueError("Pi RPC command refused: " + command)
             safe = rpc_data(command, value.get("data"))
+            if command == "get_state":
+                if self.observed_thinking is not None and safe["thinkingLevel"] != self.observed_thinking:
+                    raise ValueError("RPC thinking changed without a bound configuration event")
+                self.observed_thinking = safe["thinkingLevel"]
+            elif command == "set_thinking_level" and arguments["level"] != self.observed_thinking:
+                raise ValueError("RPC thinking acknowledgement lacks the requested level change")
             self.record({"type": "response", "id": request_id, "command": command, "success": True, "data": safe})
             self.responses[request_id] = safe
+            return
+        if value["type"] == "thinking_level_changed":
+            if self.prompt_sent or len(self.pending) != 1:
+                raise ValueError("Unsolicited RPC configuration event")
+            request_id, command = next(iter(self.pending.items()))
+            if request_id in self.configuration_events:
+                raise ValueError("Repeated RPC configuration event")
+            record = configuration_event_record(value, request_id, command, self.pending_arguments[request_id], self.observed_thinking)
+            self.configuration_events.add(request_id)
+            self.observed_thinking = record["level"]
+            self.record(record)
             return
         if not self.prompt_sent or value["type"] in {"extension_ui_request", "error"}:
             raise ValueError("Unexpected activity outside the approved task prompt")
@@ -560,6 +592,7 @@ def verify_rpc_configuration(results, task):
     if not records or len(records) > 10000 or records[-2:] != [{"type": "stdin_closed"}, {"type": "exit", "exit_code": 0}]:
         raise ValueError("RPC transcript lacks orderly shutdown")
     requests, responses, events = [], {}, []
+    observed_thinking, configuration_requests = None, set()
     for index, record in enumerate(records[:-2]):
         if not isinstance(record, dict):
             raise ValueError("Invalid RPC transcript record")
@@ -574,7 +607,26 @@ def verify_rpc_configuration(results, task):
             matched = [request for _position, request in requests if request["id"] == record["id"]]
             if len(matched) != 1 or record["command"] != matched[0]["command"] or rpc_data(record["command"], record["data"]) != record["data"]:
                 raise ValueError("RPC response differs from its safe request contract")
+            if record["command"] == "get_state":
+                thinking = record["data"]["thinkingLevel"]
+                if observed_thinking is not None and thinking != observed_thinking:
+                    raise ValueError("RPC state thinking differs from configuration events")
+                observed_thinking = thinking
+            elif record["command"] == "set_thinking_level" and matched[0]["arguments"].get("level") != observed_thinking:
+                raise ValueError("RPC setter acknowledgement lacks its level change")
             responses[record["id"]] = (index, record["data"])
+        elif kind == "configuration_event":
+            pending = [request for _position, request in requests if request["id"] not in responses]
+            if len(pending) != 1 or any(request["command"] == "prompt" for _position, request in requests):
+                raise ValueError("Unsolicited returned RPC configuration event")
+            request = pending[0]
+            if request["id"] in configuration_requests:
+                raise ValueError("Repeated returned RPC configuration event")
+            expected_event = configuration_event_record({"type": record.get("event"), "level": record.get("level")}, request["id"], request["command"], request["arguments"], observed_thinking)
+            if record != expected_event:
+                raise ValueError("RPC configuration event is not bound to its operation")
+            configuration_requests.add(request["id"])
+            observed_thinking = record["level"]
         elif record == {"type": "event", "event": "agent_settled"}:
             events.append(index)
         else:

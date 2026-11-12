@@ -81,6 +81,16 @@ model = {'provider':'example','id':'model','headers':{'Authorization':'synthetic
 thinking = 'high'
 levels = ['off','minimal','low','medium','high','xhigh','max']
 held = None
+def change_thinking(level):
+    global thinking
+    if level == thinking: return
+    thinking = level
+    event={'type':'thinking_level_changed','level':level,'private_metadata':'synthetic-private-marker'}
+    if behavior=='malformed-configuration': event['level']=[]
+    if behavior=='agent-before-prompt': event={'type':'agent_start'}
+    if behavior not in ('missing-configuration','late-configuration'):
+        print(json.dumps(event),flush=True)
+        if behavior=='duplicate-configuration': print(json.dumps(event),flush=True)
 def reply(request, data=None):
     value={'type':'response','id':request['id'],'command':request['type'],'success':True,'data':data}
     if behavior=='wrong-response': value['id']='foreign'
@@ -100,6 +110,7 @@ for line in sys.stdin:
     command=request['type']
     if behavior=='no-response': continue
     if command=='get_available_models':
+        if behavior=='unsolicited-configuration': print(json.dumps({'type':'thinking_level_changed','level':'low'}),flush=True)
         data={'models':[model,{'provider':'second','id':'model-two','headers':{'secret':'synthetic-private-marker'}}]}
         if behavior=='out-of-order': held=(request,data);continue
     elif command=='get_state':
@@ -108,8 +119,9 @@ for line in sys.stdin:
     elif command=='get_available_thinking_levels': data={'levels':['low'] if behavior=='only-low' else levels}
     elif command=='set_model':
         model={'provider':request['provider'],'id':request['modelId']};data=model
+        change_thinking('low')
     elif command=='set_thinking_level':
-        thinking='low' if behavior=='clamped' else request['level'];data=None
+        change_thinking('low' if behavior=='clamped' else request['level']);data=None
     elif command=='prompt':
         if behavior=='no-prompt-ack': continue
         reply(request)
@@ -121,6 +133,7 @@ for line in sys.stdin:
         continue
     else: raise AssertionError(command)
     reply(request,data)
+    if behavior=='late-configuration' and command=='set_thinking_level': print(json.dumps({'type':'thinking_level_changed','level':thinking}),flush=True)
     if held:
         reply(*held);held=None
 '''
@@ -574,6 +587,60 @@ class RpcTests(unittest.TestCase):
                 self.assertEqual(coordinate.worker(root), 1)
                 self.assertFalse(any(request["type"] == "prompt" for request in self.requests(root)))
                 self.assertFalse((root / "results/model-report.json").exists())
+
+    def test_native_configuration_events_bind_setters_and_metadata_defaults(self):
+        cases = [("thinking", {"thinking": "low"}, False, "high", ["set_thinking_level"]),
+                 ("model", {"provider": "second", "model": "model-two", "thinking": "max"}, False, "high", ["set_model", "set_thinking_level"]),
+                 ("same-value", {}, False, "high", []),
+                 ("metadata", {}, True, "low", ["set_thinking_level"])]
+        for name, options, metadata, default_thinking, expected in cases:
+            with self.subTest(case=name):
+                root = self.prepare(name=name, options=options, metadata=metadata)
+                task = coordinate.read_json(root / "task.json")
+                task["runtime_defaults"]["thinking"] = default_thinking
+                dump(root / "task.json", task)
+                self.assertEqual(coordinate.worker(root), 0)
+                coordinate.verify_return(root / "results", task, {"answer.txt": b"before\n"}, "run-one")
+                records = [json.loads(line) for line in (root / "results/rpc-events.jsonl").read_text().splitlines()]
+                changes = [record for record in records if record["type"] == "configuration_event"]
+                self.assertEqual([record["command"] for record in changes], expected)
+                for event in changes:
+                    request_index = next(index for index, record in enumerate(records) if record["type"] == "request" and record["id"] == event["id"])
+                    response_index = next(index for index, record in enumerate(records) if record["type"] == "response" and record["id"] == event["id"])
+                    self.assertLess(request_index, records.index(event))
+                    self.assertLess(records.index(event), response_index)
+                self.assertNotIn(b"synthetic-private-marker", (root / "results/rpc-events.jsonl").read_bytes())
+                if metadata: self.assertFalse(self.requests(root)[-1]["type"] == "prompt")
+
+    def test_unsolicited_malformed_or_unacknowledged_configuration_refuses_before_prompt(self):
+        for behavior in ["unsolicited-configuration", "malformed-configuration", "duplicate-configuration", "missing-configuration", "late-configuration", "agent-before-prompt"]:
+            with self.subTest(behavior=behavior):
+                root = self.prepare(name=behavior, behavior=behavior, options={"thinking": "low"})
+                self.assertEqual(coordinate.worker(root), 1)
+                self.assertFalse(any(request["type"] == "prompt" for request in self.requests(root)))
+                self.assertFalse((root / "results/rpc-configuration.json").exists())
+
+    def test_returned_configuration_event_reordering_or_rebinding_is_rejected(self):
+        root = self.prepare(options={"thinking": "low"})
+        self.assertEqual(coordinate.worker(root), 0)
+        task = coordinate.read_json(root / "task.json")
+        for change in ["late", "foreign", "wrong-level", "duplicate", "missing"]:
+            with self.subTest(change=change):
+                output = root / change; shutil.copytree(root / "results", output)
+                records = [json.loads(line) for line in (output / "rpc-events.jsonl").read_text().splitlines()]
+                event_index = next(index for index, record in enumerate(records) if record["type"] == "configuration_event")
+                event = records[event_index]
+                if change == "late":
+                    records.pop(event_index); records.insert(event_index + 1, event)
+                elif change == "foreign": event["id"] = "request-foreign"
+                elif change == "wrong-level": event["level"] = "medium"
+                elif change == "duplicate": records.insert(event_index, dict(event))
+                else: records.pop(event_index)
+                (output / "rpc-events.jsonl").write_text(''.join(json.dumps(record)+'\n' for record in records))
+                configuration = coordinate.read_json(output / "rpc-configuration.json"); configuration["rpc_log_sha256"] = coordinate.digest((output / "rpc-events.jsonl").read_bytes()); dump(output / "rpc-configuration.json", configuration)
+                receipt = coordinate.read_json(output / "worker-receipt.json"); receipt["configuration"] = configuration; receipt["artifact_sha256"] = {name: coordinate.digest(raw) for name, raw in coordinate.snapshot(output).items() if name != "worker-receipt.json"}; dump(output / "worker-receipt.json", receipt)
+                with self.assertRaises(ValueError): coordinate.verify_return(output, task, {"answer.txt": b"before\n"}, "run-one")
+                with self.assertRaises(ValueError): coordinate.verify_recovered_artifacts(output, task, {"answer.txt": b"before\n"})
 
     def test_correlated_metadata_accepts_out_of_order_responses(self):
         root = self.prepare(behavior="out-of-order")
