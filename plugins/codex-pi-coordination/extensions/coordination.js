@@ -68,11 +68,27 @@ export function loadTask(taskPath, cwd) {
     fs.closeSync(descriptor);
   }
   const task = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw));
-  if (!task || typeof task !== "object" || Array.isArray(task) || task.version !== 1 || !taskKinds.has(task.kind)) {
-    fail("invalid_task", "Expected a version 1 coordination task and supported kind");
+  if (!task || typeof task !== "object" || Array.isArray(task) || ![1, 2].includes(task.version) || !taskKinds.has(task.kind)) {
+    fail("invalid_task", "Expected a supported versioned coordination task and kind");
   }
   for (const key of ["run_id", "task_id"]) {
-    if (!/^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$/.test(boundedString(task[key], key, 128))) fail("invalid_task", `Invalid ${key}`);
+    const pattern = key === "task_id" && task.version === 1
+      ? /^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$/
+      : /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+    const value = boundedString(task[key], key, 128);
+    if (pattern.exec(value)?.[0] !== value) fail("invalid_task", `Invalid ${key}`);
+  }
+  if (task.version === 1 && "run_options" in task) fail("invalid_task", "Version 1 cannot contain run_options");
+  if (task.version === 2) {
+    const options = task.run_options;
+    const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+    const identifierPattern = "[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}";
+    const matchesIdentifier = (value, pattern) => typeof value === "string" && !value.includes("://") && new RegExp(`^${pattern}$`).exec(value)?.[0] === value;
+    const identifier = (value) => matchesIdentifier(value, identifierPattern);
+    // Each component may contain slashes; only the exact runtime catalog picks a pair.
+    const qualifiedDefault = (value) => matchesIdentifier(value, `${identifierPattern}/${identifierPattern}`);
+    if (!options || typeof options !== "object" || Array.isArray(options) || Object.keys(options).some((key) => !["provider", "model", "thinking"].includes(key)) || (("provider" in options) !== ("model" in options)) || ("provider" in options && (!identifier(options.provider) || !identifier(options.model))) || ("thinking" in options && !levels.includes(options.thinking))) fail("invalid_task", "Invalid version 2 run options");
+    if (task.operation !== "run" || !task.runtime_defaults || Object.keys(task.runtime_defaults).sort().join(",") !== "model,thinking" || !qualifiedDefault(task.runtime_defaults.model) || !levels.includes(task.runtime_defaults.thinking)) fail("invalid_task", "Invalid version 2 runtime defaults");
   }
   boundedString(task.instructions, "instructions", 48000);
   for (const key of ["workspace", "output_directory"]) {
@@ -141,6 +157,7 @@ export default function coordinationExtension(pi) {
   let toolCalls = 0;
   let turns = 0;
   let handedOff = false;
+  let configurationRecorded = false;
   const requested = () => pi.getFlag("coordination-task");
   const status = () => ({ active: Boolean(loaded), run_id: loaded?.task.run_id, task_id: loaded?.task.task_id, task_sha256: loaded?.taskSha256, tool_calls: toolCalls, turns, handed_off: handedOff, failure });
   const record = (type, fields = {}) => {
@@ -154,7 +171,7 @@ export default function coordinationExtension(pi) {
     return { block: true, reason: `${code}: ${message}` };
   };
 
-  pi.registerFlag("coordination-task", { type: "string", description: "Absolute path to an external coordinator's version 1 task manifest" });
+  pi.registerFlag("coordination-task", { type: "string", description: "Absolute path to an external coordinator's versioned task manifest" });
   pi.registerCommand("coordination-status", {
     description: "Show the current delegated task and bounds",
     handler: async (_args, ctx) => { if (ctx.hasUI) ctx.ui.notify(JSON.stringify(status()), "info"); },
@@ -212,6 +229,24 @@ export default function coordinationExtension(pi) {
     if (!loaded || failure || handedOff) {
       stop(ctx, "task_unavailable", "Coordination task is unavailable or already handed off");
       return;
+    }
+    if (loaded.task.version === 2 && !configurationRecorded) {
+      const configuration = { provider: ctx.model?.provider, model: ctx.model?.id, thinking: pi.getThinkingLevel() };
+      if (!configuration.provider || !configuration.model || !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(configuration.thinking)) {
+        stop(ctx, "configuration_unavailable", "Pi did not expose an effective run configuration");
+        return;
+      }
+      const options = loaded.task.run_options;
+      const selectedModelMatches = options.provider
+        ? configuration.provider === options.provider && configuration.model === options.model
+        : `${configuration.provider}/${configuration.model}` === loaded.task.runtime_defaults.model;
+      const selectedThinking = options.thinking ?? loaded.task.runtime_defaults.thinking;
+      if (!selectedModelMatches || configuration.thinking !== selectedThinking) {
+        stop(ctx, "configuration_mismatch", "Effective Pi options differ from the approved task");
+        return;
+      }
+      record("run_configuration", { configuration });
+      configurationRecorded = true;
     }
     return { systemPrompt: `${event.systemPrompt}\n\nExternal coordinator task:\n${JSON.stringify({ run_id: loaded.task.run_id, task_id: loaded.task.task_id, kind: loaded.task.kind, instructions: loaded.task.instructions, source: loaded.sourceSummary, writable_paths: loaded.task.writable_paths, max_tool_calls: loaded.task.max_tool_calls, max_turns: loaded.task.max_turns })}\nWork only inside the assigned workspace and declared writable files. Shell execution is unavailable; the coordinator runs declared verification commands after Pi exits. Before the tool budget ends, call coordination_handoff exactly once with an honest self-report. Do not claim acceptance or verification from your report. Tool/path guards are task policy; the external runner owns OS isolation and custody.` };
   });

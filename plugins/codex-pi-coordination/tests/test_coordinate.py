@@ -50,6 +50,8 @@ task_digest=hashlib.sha256(task_path.read_bytes()).hexdigest()
 def extension_event(kind, calls=1, turns=1, handed_off=True, **fields):
     return {'type':kind,'at':'2000-01-01T00:00:00Z','active':True,'run_id':task['run_id'],'task_id':task['task_id'],'task_sha256':task_digest,'tool_calls':calls,'turns':turns,'handed_off':handed_off,**fields}
 extension_events=[extension_event('task_loaded',0,0,False),extension_event('tool_call',handed_off=False,tool_name='coordination_handoff',tool_call_id='call-1'),extension_event('handoff',reported_status=report['status']),extension_event('agent_settled'),extension_event('session_shutdown')]
+if task['version']==2:
+    extension_events.insert(1,extension_event('run_configuration',0,0,False,configuration=rpc_effective))
 if behavior=='extension-refused': extension_events.insert(3,extension_event('refused',failure={'code':'task_unavailable','message':'No further tools'},code='task_unavailable'))
 if behavior=='extension-failure': extension_events[-1]['failure']={'code':'tool_budget_exhausted','message':'Budget exhausted'}
 if behavior=='extension-wrong-run': extension_events[1]['run_id']='different-run'
@@ -69,6 +71,72 @@ if behavior!='extension-missing':
         for event in extension_events: stream.write(json.dumps(event)+'\n')
 for event in events: print(json.dumps(event),flush=True)
 raise SystemExit(7 if behavior=='exit-seven' else 0)
+'''
+
+FAKE_RPC = 'PRINT_FIXTURE = ' + repr(FAKE_PI) + '\n' + r'''
+import json, pathlib, sys, os
+behavior = sys.argv[1]
+requests_file = pathlib.Path(__file__).with_suffix('.requests.jsonl')
+model = {'provider':'example','id':'model','headers':{'Authorization':'synthetic-private-marker'},'baseUrl':'https://synthetic.invalid/private'}
+thinking = 'high'
+levels = ['off','minimal','low','medium','high','xhigh','max']
+if behavior=='off-only': thinking='off';levels=['off']
+held = None
+def change_thinking(level):
+    global thinking
+    if level == thinking: return
+    thinking = level
+    event={'type':'thinking_level_changed','level':level,'private_metadata':'synthetic-private-marker'}
+    if behavior=='malformed-configuration': event['level']=[]
+    if behavior=='agent-before-prompt': event={'type':'agent_start'}
+    if behavior not in ('missing-configuration','late-configuration'):
+        print(json.dumps(event),flush=True)
+        if behavior=='duplicate-configuration': print(json.dumps(event),flush=True)
+def reply(request, data=None):
+    value={'type':'response','id':request['id'],'command':request['type'],'success':True,'data':data}
+    if behavior=='wrong-response': value['id']='foreign'
+    if behavior=='wrong-command': value['command']='foreign'
+    if behavior=='refused': value.update(success=False,error='synthetic-private-marker')
+    line=json.dumps(value)+'\r\n'
+    if behavior=='malformed': line='{bad}\n'
+    if behavior=='partial': sys.stdout.write('{"type":');sys.stdout.flush();raise SystemExit(0)
+    if behavior=='oversized': line='x'* (4*1024*1024+1)+'\n'
+    if behavior=='stderr-overflow': sys.stderr.write('x'*(4*1024*1024+1));sys.stderr.flush()
+    if behavior=='noisy': sys.stderr.write('synthetic diagnostic\n'*10000);sys.stderr.flush()
+    sys.stdout.write(line);sys.stdout.flush()
+    if behavior=='duplicate': sys.stdout.write(line);sys.stdout.flush()
+for line in sys.stdin:
+    request=json.loads(line)
+    with requests_file.open('a') as stream: stream.write(json.dumps(request)+'\n')
+    command=request['type']
+    if behavior=='no-response': continue
+    if command=='get_available_models':
+        if behavior=='unsolicited-configuration': print(json.dumps({'type':'thinking_level_changed','level':'low'}),flush=True)
+        data={'models':[model,{'provider':'second','id':'model-two','headers':{'secret':'synthetic-private-marker'}}]}
+        if behavior=='out-of-order': held=(request,data);continue
+    elif command=='get_state':
+        data={'model':model,'thinkingLevel':thinking,'sessionId':'session-one','sessionFile':None,'isStreaming':False,'isCompacting':False,'pendingMessageCount':0}
+        if behavior=='busy': data['pendingMessageCount']=1
+    elif command=='get_available_thinking_levels': data={'levels':['low'] if behavior=='only-low' else levels}
+    elif command=='set_model':
+        model={'provider':request['provider'],'id':request['modelId']};data=model
+        change_thinking('low')
+    elif command=='set_thinking_level':
+        change_thinking('low' if behavior=='clamped' else request['level']);data=None
+    elif command=='prompt':
+        if behavior=='no-prompt-ack': continue
+        reply(request)
+        namespace={'rpc_effective':{'provider':model['provider'],'model':model['id'],'thinking':thinking}}
+        try: exec(PRINT_FIXTURE,namespace)
+        except SystemExit as result:
+            if result.code: raise
+        if behavior!='no-settlement': print(json.dumps({'type':'agent_settled'}),flush=True)
+        continue
+    else: raise AssertionError(command)
+    reply(request,data)
+    if behavior=='late-configuration' and command=='set_thinking_level': print(json.dumps({'type':'thinking_level_changed','level':thinking}),flush=True)
+    if held:
+        reply(*held);held=None
 '''
 
 FAKE_EXEC = r'''
@@ -102,7 +170,164 @@ def make_archive(entries):
     return output.getvalue()
 
 
+def native_extension_load_results(cases):
+    # Exercise the actual extension, without Pi, an owner or a model prompt.
+    program = """import fs from 'node:fs';
+const {loadTask} = await import(process.argv[1]);
+const cases = JSON.parse(fs.readFileSync(0, 'utf8'));
+console.log(JSON.stringify(cases.map(item => { try { loadTask(item.task, item.cwd); return true; } catch { return false; } })));
+"""
+    result = subprocess.run(["node", "--input-type=module", "-e", program, (SCRIPT.parent.parent / "extensions/coordination.js").as_uri()], input=json.dumps(cases), text=True, capture_output=True, timeout=10, check=True)
+    return json.loads(result.stdout)
+
+
 class ContractTests(unittest.TestCase):
+    def test_python_versioned_task_boundary_matches_actual_extension(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"; workspace.mkdir()
+            output = root / "results"; output.mkdir()
+            cases = []
+            for version, maximum in [(1, 80), (2, 128)]:
+                variants = [(identifier, {}, valid) for identifier, valid in [("task-one", True), ("t" * maximum, True), ("project:T001", version == 2), ("t" * (maximum + 1), False), ("task-one\n", False), ("task-one\r\n", False)]]
+                variants += [("task-one", {"run_options": options}, version == 2) for options in [{}, {"thinking": "low"}]]
+                for identifier, fields, expected in variants:
+                    public = {**task_template(), "version": version, "task_id": identifier, **fields}
+                    if expected:
+                        self.assertEqual(coordinate.validate_task(public), public)
+                    else:
+                        with self.assertRaises(ValueError): coordinate.validate_task(public)
+                    task_path = root / f"task-{len(cases)}.json"
+                    native = {**public, "run_id": "run-one", "workspace": str(workspace), "output_directory": str(output), "allowed_tools": ["read"], "max_tool_calls": 8}
+                    if version == 2:
+                        native.update(operation="run", run_options=public.get("run_options", {}), runtime_defaults={"model": "example/model", "thinking": "high"})
+                    dump(task_path, native)
+                    cases.append({"task": str(task_path), "cwd": str(workspace), "expected": expected})
+                # The public assignment never chooses a run ID; native artifacts do.
+                with self.assertRaises(ValueError):
+                    coordinate.validate_task({**task_template(), "version": version, "run_id": "run-one"})
+            self.assertEqual(native_extension_load_results(cases), [case["expected"] for case in cases])
+            self.assertEqual(list(output.iterdir()), [])
+
+    def test_version_two_options_and_namespaced_ids_are_strict(self):
+        task = {**task_template(), "version": 2, "task_id": "project:T001", "run_options": {"thinking": "max"}}
+        self.assertEqual(coordinate.validate_task(task), task)
+        for options in [{"model": "unpaired"}, {"provider": "unpaired"}, {"thinking": "auto"}, {"thinking": "dynamic"}, {"thinking": "default"}, {"thinking": []}, {"extra": "value"}, {"provider": "https://example.invalid", "model": "id"}]:
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                coordinate.validate_task({**task, "run_options": options})
+        with self.assertRaises(ValueError):
+            coordinate.validate_task({**task, "version": 1})
+
+    def test_default_registration_is_private_idempotent_and_refuses_conflicts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.json"
+            profile = {"sandbox_name": "fixture", "sandbox_id": "exact-id", "pi_argv": ["pi"], "model": "example/model"}
+            dump(source, profile)
+            destination = root / "settings/profile.json"
+            first = coordinate.configure_profile(source, destination)
+            self.assertTrue(first["changed"])
+            self.assertFalse(first["runtime_verified"])
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(destination.parent.stat().st_mode & 0o777, 0o700)
+            original = destination.read_bytes()
+            dump(source, dict(reversed(list(profile.items()))))
+            self.assertFalse(coordinate.configure_profile(source, destination)["changed"])
+            self.assertEqual(destination.read_bytes(), original)
+            dump(source, {**profile, "thinking": "low"})
+            with self.assertRaises(ValueError): coordinate.configure_profile(source, destination)
+            link = root / "linked"; link.symlink_to(destination.parent, target_is_directory=True)
+            with self.assertRaises(ValueError): coordinate.configure_profile(source, link / "profile.json")
+            destination.unlink(); destination.symlink_to(source)
+            with self.assertRaises(ValueError): coordinate.configure_profile(source, destination)
+
+    def test_profile_model_syntax_refuses_unusable_defaults_before_registration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.json"
+            profile = {"sandbox_name": "fixture", "sandbox_id": "exact-id", "pi_argv": ["pi"], "model": "example/model"}
+            task_file = root / "task.json"; dump(task_file, task_template())
+            for index, model in enumerate(["bad model", "example/bad model", "https://example.invalid/model", "unqualified", "a" * 257 + "/model", "example/" + "b" * 257, "a" * 10000, "example/model\n"]):
+                with self.subTest(model=model[:40]):
+                    dump(source, {**profile, "model": model})
+                    destination = root / str(index) / "profile.json"
+                    with self.assertRaises(ValueError): coordinate.configure_profile(source, destination)
+                    self.assertFalse(destination.parent.exists())
+                    with self.assertRaises(ValueError): coordinate.profile_settings(source, require_qualified_model=True)
+                    self.assertEqual(coordinate.profile_settings(source)["model"], model)
+                    output = root / f"run-{index}"
+                    with mock.patch.object(coordinate, "OpenShellOwner") as owner, contextlib.redirect_stderr(io.StringIO()):
+                        self.assertEqual(coordinate.main(["run", str(task_file), "--profile", str(source), "--output", str(output)]), 1)
+                        owner.assert_not_called()
+                    self.assertFalse(output.exists())
+            for model in ["one/two/three", "provider/model:revision", "a" * 256 + "/" + "b" * 256, "a/" + "b" * 254 + "/c/" + "d" * 254]:
+                with self.subTest(valid_model=model[:40]):
+                    dump(source, {**profile, "model": model})
+                    self.assertEqual(coordinate.profile_settings(source, require_qualified_model=True), {**profile, "model": model})
+
+    def test_python_qualified_defaults_match_actual_extension_loading(self):
+        valid_pairs = [("p", "m"), ("p", "m" * 255), ("p" * 256, "m" * 256), ("a/" + "b" * 254, "c/" + "d" * 254)]
+        invalid_models = ["bare", "p/", "/m", "_p/m", "p/_m", "https://example/model", "p/m\n", "p/m\r\n", "p/bad model", "p" * 257 + "/m", "p/" + "m" * 257, "p" * 256 + "/" + "m" * 257]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"; workspace.mkdir()
+            output = root / "results"; output.mkdir()
+            source = root / "profile.json"
+            cases = []
+            for index, (model, pair) in enumerate([(provider + "/" + model, (provider, model)) for provider, model in valid_pairs] + [(model, None) for model in invalid_models]):
+                profile = {"sandbox_name": "fixture", "sandbox_id": "exact-id", "pi_argv": ["pi"], "model": model}
+                dump(source, profile)
+                destination = root / f"default-{index}" / "profile.json"
+                if pair:
+                    self.assertTrue(coordinate.configure_profile(source, destination)["changed"])
+                    defaults = {"model": coordinate.profile_settings(destination, require_qualified_model=True)["model"], "thinking": "high"}
+                    self.assertEqual(coordinate.desired_configuration({"run_options": {}, "runtime_defaults": defaults}, [{"provider": pair[0], "id": pair[1]}]), {"provider": pair[0], "model": pair[1], "thinking": "high"})
+                else:
+                    with self.assertRaises(ValueError): coordinate.configure_profile(source, destination)
+                    self.assertFalse(destination.parent.exists())
+                    defaults = {"model": model, "thinking": "high"}
+                task_path = root / f"task-{index}.json"
+                dump(task_path, {**task_template(), "version": 2, "run_id": "run-one", "operation": "run", "run_options": {}, "runtime_defaults": defaults, "workspace": str(workspace), "output_directory": str(output), "allowed_tools": ["read"], "max_tool_calls": 8})
+                cases.append({"task": str(task_path), "cwd": str(workspace), "expected": pair is not None})
+            self.assertEqual(native_extension_load_results(cases), [case["expected"] for case in cases])
+            self.assertEqual(list(output.iterdir()), [])
+            ambiguous = [{"provider": "one/two", "id": "three"}, {"provider": "one", "id": "two/three"}]
+            selection = {"run_options": {}, "runtime_defaults": {"model": "one/two/three", "thinking": "high"}}
+            with self.assertRaisesRegex(ValueError, "ambiguous"):
+                coordinate.desired_configuration(selection, ambiguous)
+            selection["run_options"] = {"provider": "one/two", "model": "three"}
+            self.assertEqual(coordinate.desired_configuration(selection, ambiguous), {"provider": "one/two", "model": "three", "thinking": "high"})
+
+    def test_default_registration_compares_effective_defaults_without_rewriting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.json"
+            profile = {"sandbox_name": "fixture", "sandbox_id": "exact-id", "pi_argv": ["pi"], "model": "example/model"}
+            defaults = {"openshell_argv": ["openshell"], "python": "python3", "remote_parent": "/sandbox/codex-pi", "thinking": "high", "environment": {}, "protected_sandboxes": []}
+            cases = [{key: value} for key, value in defaults.items()] + [defaults]
+            for index, explicit in enumerate(cases):
+                for reverse in [False, True]:
+                    with self.subTest(explicit=explicit, reverse=reverse):
+                        initial, repeated = (profile, {**profile, **explicit}) if not reverse else ({**profile, **explicit}, profile)
+                        dump(source, initial)
+                        destination = root / f"{index}-{reverse}" / "profile.json"
+                        self.assertTrue(coordinate.configure_profile(source, destination)["changed"])
+                        before = (destination.read_bytes(), destination.stat().st_ino, destination.stat().st_mtime_ns)
+                        dump(source, repeated)
+                        self.assertFalse(coordinate.configure_profile(source, destination)["changed"])
+                        self.assertEqual((destination.read_bytes(), destination.stat().st_ino, destination.stat().st_mtime_ns), before)
+            for key, value in {"openshell_argv": ["different-owner"], "python": "different-python", "remote_parent": "/sandbox/different", "thinking": "low", "environment": {"PYTHONDONTWRITEBYTECODE": "1"}, "protected_sandboxes": ["other-sandbox"]}.items():
+                with self.subTest(conflict=key):
+                    dump(source, {**profile, key: value})
+                    with self.assertRaises(ValueError): coordinate.configure_profile(source, destination)
+                    self.assertEqual(destination.read_bytes(), before[0])
+            dump(source, profile)
+            destination.chmod(0o644)
+            with self.assertRaises(ValueError): coordinate.configure_profile(source, destination)
+            destination.chmod(0o600); destination.parent.chmod(0o755)
+            with self.assertRaises(ValueError): coordinate.configure_profile(source, destination)
+            self.assertEqual(destination.read_bytes(), before[0])
+
     def test_malformed_tasks_fail_as_validation_errors(self):
         bad_fields = [("version", True), ("kind", []), ("task_id", "../escape"),
                       ("instructions", ""), ("writable_paths", ["."]),
@@ -443,9 +668,267 @@ for(const event of [{type:'tool_execution_start',toolCallId:'handoff-1',toolName
             coordinate.verify_return(pristine, task, source, "unrelated-run")
 
 
+class RpcTests(unittest.TestCase):
+    def setUp(self):
+        WorkerTests.setUp(self)
+        self.fake_pi_processes = []
+        real_initialize = coordinate.PiRpc.__init__
+
+        def retain_fake_pi_process(instance, *args, **kwargs):
+            real_initialize(instance, *args, **kwargs)
+            self.fake_pi_processes.append(instance.process)
+
+        patcher = mock.patch.object(coordinate.PiRpc, "__init__", retain_fake_pi_process)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.join_fake_pi_processes)
+
+    def join_fake_pi_processes(self):
+        # The worker closes its streams; the fixture owns the local children
+        # that stand in for the managed remote runtime's cleanup responsibility.
+        running_processes = []
+        for process in self.fake_pi_processes:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                running_processes.append(process.pid)
+        self.assertEqual(running_processes, [], "Fake Pi children did not exit after worker cleanup")
+
+    def prepare(self, name="rpc", behavior="change", options=None, metadata=False):
+        root = WorkerTests.prepare(self, name=name, behavior=behavior)
+        (root / "fake-pi.py").write_text(FAKE_RPC)
+        task = coordinate.read_json(root / "task.json")
+        task.update(version=2, task_id="project:T001", operation="capabilities" if metadata else "run", run_options=options or {}, runtime_defaults={"model": "example/model", "thinking": "high"})
+        if metadata:
+            task.update(writable_paths=[], checks=[])
+        dump(root / "task.json", task)
+        launch = coordinate.read_json(root / "launch.json"); launch["wall_seconds"] = 1
+        dump(root / "launch.json", launch)
+        return root
+
+    def requests(self, root):
+        path = root / "fake-pi.requests.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_default_and_exact_overrides_return_real_changes_with_private_metadata_removed(self):
+        for index, options in enumerate([{}, {"thinking": "low"}, {"provider": "second", "model": "model-two", "thinking": "max"}]):
+            with self.subTest(options=options):
+                root = self.prepare(name=str(index), options=options)
+                launch_before = (root / "launch.json").read_bytes()
+                self.assertEqual(coordinate.worker(root), 0)
+                task = coordinate.read_json(root / "task.json")
+                receipt = coordinate.verify_return(root / "results", task, {"answer.txt": b"before\n"}, "run-one")
+                effective = receipt["configuration"]["effective"]
+                self.assertEqual(effective["thinking"], options.get("thinking", "high"))
+                self.assertEqual(effective["provider"], options.get("provider", "example"))
+                self.assertEqual((root / "results/changed-files/answer.txt").read_bytes(), b"after\n")
+                self.assertEqual((root / "launch.json").read_bytes(), launch_before)
+                self.assertEqual(sum(request["type"] == "prompt" for request in self.requests(root)), 1)
+                for contents in coordinate.snapshot(root / "results").values():
+                    self.assertNotIn(b"synthetic-private-marker", contents)
+                    self.assertNotIn(b"synthetic.invalid", contents)
+
+    def test_options_refuse_before_prompt_without_fallback(self):
+        cases = [("unchanged", {"provider": "absent", "model": "absent"}), ("only-low", {}), ("clamped", {"thinking": "max"}), ("busy", {})]
+        for index, (behavior, options) in enumerate(cases):
+            with self.subTest(behavior=behavior):
+                root = self.prepare(name=str(index), behavior=behavior, options=options)
+                self.assertEqual(coordinate.worker(root), 1)
+                self.assertFalse(any(request["type"] == "prompt" for request in self.requests(root)))
+                self.assertFalse((root / "results/model-report.json").exists())
+
+    def test_native_configuration_events_bind_setters_without_changing_metadata_defaults(self):
+        cases = [("thinking", {"thinking": "low"}, False, "high", ["set_thinking_level"]),
+                 ("model", {"provider": "second", "model": "model-two", "thinking": "max"}, False, "high", ["set_model", "set_thinking_level"]),
+                 ("same-value", {}, False, "high", []),
+                 ("metadata", {}, True, "low", [])]
+        for name, options, metadata, default_thinking, expected in cases:
+            with self.subTest(case=name):
+                root = self.prepare(name=name, options=options, metadata=metadata)
+                task = coordinate.read_json(root / "task.json")
+                task["runtime_defaults"]["thinking"] = default_thinking
+                dump(root / "task.json", task)
+                self.assertEqual(coordinate.worker(root), 0)
+                coordinate.verify_return(root / "results", task, {"answer.txt": b"before\n"}, "run-one")
+                records = [json.loads(line) for line in (root / "results/rpc-events.jsonl").read_text().splitlines()]
+                changes = [record for record in records if record["type"] == "configuration_event"]
+                self.assertEqual([record["command"] for record in changes], expected)
+                for event in changes:
+                    request_index = next(index for index, record in enumerate(records) if record["type"] == "request" and record["id"] == event["id"])
+                    response_index = next(index for index, record in enumerate(records) if record["type"] == "response" and record["id"] == event["id"])
+                    self.assertLess(request_index, records.index(event))
+                    self.assertLess(records.index(event), response_index)
+                self.assertNotIn(b"synthetic-private-marker", (root / "results/rpc-events.jsonl").read_bytes())
+                if metadata: self.assertFalse(self.requests(root)[-1]["type"] == "prompt")
+
+    def test_unsolicited_malformed_or_unacknowledged_configuration_refuses_before_prompt(self):
+        for behavior in ["unsolicited-configuration", "malformed-configuration", "duplicate-configuration", "missing-configuration", "late-configuration", "agent-before-prompt"]:
+            with self.subTest(behavior=behavior):
+                root = self.prepare(name=behavior, behavior=behavior, options={"thinking": "low"})
+                self.assertEqual(coordinate.worker(root), 1)
+                self.assertFalse(any(request["type"] == "prompt" for request in self.requests(root)))
+                self.assertFalse((root / "results/rpc-configuration.json").exists())
+
+    def test_returned_configuration_event_reordering_or_rebinding_is_rejected(self):
+        root = self.prepare(options={"thinking": "low"})
+        self.assertEqual(coordinate.worker(root), 0)
+        task = coordinate.read_json(root / "task.json")
+        for change in ["late", "foreign", "wrong-level", "duplicate", "missing"]:
+            with self.subTest(change=change):
+                output = root / change; shutil.copytree(root / "results", output)
+                records = [json.loads(line) for line in (output / "rpc-events.jsonl").read_text().splitlines()]
+                event_index = next(index for index, record in enumerate(records) if record["type"] == "configuration_event")
+                event = records[event_index]
+                if change == "late":
+                    records.pop(event_index); records.insert(event_index + 1, event)
+                elif change == "foreign": event["id"] = "request-foreign"
+                elif change == "wrong-level": event["level"] = "medium"
+                elif change == "duplicate": records.insert(event_index, dict(event))
+                else: records.pop(event_index)
+                (output / "rpc-events.jsonl").write_text(''.join(json.dumps(record)+'\n' for record in records))
+                configuration = coordinate.read_json(output / "rpc-configuration.json"); configuration["rpc_log_sha256"] = coordinate.digest((output / "rpc-events.jsonl").read_bytes()); dump(output / "rpc-configuration.json", configuration)
+                receipt = coordinate.read_json(output / "worker-receipt.json"); receipt["configuration"] = configuration; receipt["artifact_sha256"] = {name: coordinate.digest(raw) for name, raw in coordinate.snapshot(output).items() if name != "worker-receipt.json"}; dump(output / "worker-receipt.json", receipt)
+                with self.assertRaises(ValueError): coordinate.verify_return(output, task, {"answer.txt": b"before\n"}, "run-one")
+                with self.assertRaises(ValueError): coordinate.verify_recovered_artifacts(output, task, {"answer.txt": b"before\n"})
+
+    def test_correlated_metadata_accepts_out_of_order_responses(self):
+        root = self.prepare(behavior="out-of-order")
+        self.assertEqual(coordinate.worker(root), 0)
+        coordinate.verify_return(root / "results", coordinate.read_json(root / "task.json"), {"answer.txt": b"before\n"}, "run-one")
+
+    def test_stderr_backpressure_is_drained_without_becoming_protocol(self):
+        root = self.prepare(behavior="noisy")
+        self.assertEqual(coordinate.worker(root), 0)
+        self.assertGreater((root / "results/rpc/stderr.log").stat().st_size, 65536)
+        self.assertNotIn(b"synthetic diagnostic", (root / "results/rpc-events.jsonl").read_bytes())
+        coordinate.verify_return(root / "results", coordinate.read_json(root / "task.json"), {"answer.txt": b"before\n"}, "run-one")
+
+    def test_interruption_closes_exact_child_stdin_without_fabricating_completion(self):
+        root = self.prepare(behavior="no-response")
+        children = []
+        real_init = coordinate.PiRpc.__init__
+        def track_child(instance, *args, **kwargs):
+            real_init(instance, *args, **kwargs)
+            children.append(instance.process)
+        with mock.patch.object(coordinate.PiRpc, "__init__", track_child), mock.patch.object(coordinate.PiRpc, "pump", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt): coordinate.worker(root)
+        self.assertEqual(len(children), 1)
+        self.assertEqual(children[0].wait(timeout=2), 0)
+        self.assertFalse((root / "results/rpc-configuration.json").exists())
+        self.assertEqual(coordinate.read_json(root / "results/worker-receipt.json")["outcome"], "incomplete")
+
+    def test_bad_protocol_and_bounds_never_prompt_or_return_success(self):
+        for behavior in ["wrong-response", "wrong-command", "duplicate", "refused", "malformed", "partial", "oversized", "stderr-overflow", "no-response"]:
+            with self.subTest(behavior=behavior):
+                root = self.prepare(name=behavior, behavior=behavior)
+                self.assertEqual(coordinate.worker(root), 1)
+                self.assertFalse(any(request["type"] == "prompt" for request in self.requests(root)))
+                self.assertFalse((root / "results/rpc-configuration.json").exists())
+
+    def test_missing_ack_or_settlement_is_not_retried_and_checks_do_not_run(self):
+        for behavior in ["no-prompt-ack", "no-settlement"]:
+            root = self.prepare(name=behavior, behavior=behavior)
+            self.assertEqual(coordinate.worker(root), 1)
+            self.assertEqual(sum(request["type"] == "prompt" for request in self.requests(root)), 1)
+            self.assertFalse((root / "results/changes.json").exists())
+
+    def test_metadata_only_has_no_prompt_extension_or_change_artifacts(self):
+        root = self.prepare(metadata=True)
+        self.assertEqual(coordinate.worker(root), 0)
+        task = coordinate.read_json(root / "task.json")
+        receipt = coordinate.verify_return(root / "results", task, {"answer.txt": b"before\n"}, "run-one")
+        self.assertEqual(receipt["outcome"], "capabilities")
+        self.assertFalse(receipt["configuration"]["prompt_sent"])
+        self.assertFalse(any(request["type"] in {"prompt", "set_model", "set_thinking_level"} for request in self.requests(root)))
+
+    def test_metadata_reports_off_only_model_without_applying_profile_defaults(self):
+        for index, default_model in enumerate(["example/model", "unavailable/profile-default"]):
+            with self.subTest(default_model=default_model):
+                root = self.prepare(name=str(index), behavior="off-only", metadata=True)
+                task = coordinate.read_json(root / "task.json")
+                task["runtime_defaults"]["model"] = default_model
+                dump(root / "task.json", task)
+                self.assertEqual(coordinate.worker(root), 0)
+                receipt = coordinate.verify_return(root / "results", task, {"answer.txt": b"before\n"}, "run-one")
+                self.assertEqual(receipt["configuration"]["supported_thinking_levels"], ["off"])
+                self.assertEqual(receipt["configuration"]["effective"], {"provider": "example", "model": "model", "thinking": "off"})
+                self.assertEqual([request["type"] for request in self.requests(root)], ["get_available_models", "get_state", "get_available_thinking_levels", "get_state"])
+        task_run = self.prepare(name="task-run", behavior="off-only")
+        self.assertEqual(coordinate.worker(task_run), 1)
+        self.assertFalse(any(request["type"] == "prompt" for request in self.requests(task_run)))
+
+    def test_check_named_pi_stderr_keeps_independent_diagnostics_and_recovery_bindings(self):
+        for exit_code in [0, 7]:
+            with self.subTest(exit_code=exit_code):
+                root = self.prepare(name=str(exit_code))
+                check = {"name": "pi-stderr", "argv": [sys.executable, "-c", f"print('declared check output'); raise SystemExit({exit_code})"], "timeout_seconds": 2}
+                task = coordinate.read_json(root / "task.json"); task["checks"] = [check]; dump(root / "task.json", task)
+                launch = coordinate.read_json(root / "launch.json"); launch["checks"] = [check]; dump(root / "launch.json", launch)
+                self.assertEqual(coordinate.worker(root), int(exit_code != 0))
+                self.assertEqual((root / "results/pi-stderr.log").read_bytes(), b"declared check output\n")
+                self.assertEqual((root / "results/rpc/stderr.log").read_bytes(), b"")
+                if exit_code == 0:
+                    coordinate.verify_return(root / "results", task, {"answer.txt": b"before\n"}, "run-one")
+                coordinate.verify_recovered_artifacts(root / "results", task, {"answer.txt": b"before\n"})
+        root = self.prepare(name="before-check", behavior="refused")
+        task = coordinate.read_json(root / "task.json"); task["checks"] = [check]; dump(root / "task.json", task)
+        launch = coordinate.read_json(root / "launch.json"); launch["checks"] = [check]; dump(root / "launch.json", launch)
+        self.assertEqual(coordinate.worker(root), 1)
+        self.assertFalse((root / "results/pi-stderr.log").exists())
+        coordinate.verify_recovered_artifacts(root / "results", task, {"answer.txt": b"before\n"})
+
+    def test_trusted_check_observes_changed_bytes_after_shutdown(self):
+        root = self.prepare()
+        task = coordinate.read_json(root / "task.json")
+        check = {"name": "after-shutdown", "argv": [sys.executable, "-c", "import json,pathlib; p=pathlib.Path; assert p('answer.txt').read_text()=='after\\n'; assert json.loads(p('../results/extension-events.jsonl').read_text().splitlines()[-1])['type']=='session_shutdown'; print('checked returned bytes after shutdown')"], "timeout_seconds": 2}
+        task["checks"] = [check]; dump(root / "task.json", task)
+        launch = coordinate.read_json(root / "launch.json"); launch["checks"] = [check]; dump(root / "launch.json", launch)
+        self.assertEqual(coordinate.worker(root), 0)
+        receipt = coordinate.verify_return(root / "results", task, {"answer.txt": b"before\n"}, "run-one")
+        self.assertTrue(receipt["checks_passed"])
+        self.assertIn(b"checked returned bytes", (root / "results/after-shutdown.log").read_bytes())
+
+    def test_resealed_configuration_contradictions_are_rejected(self):
+        root = self.prepare()
+        self.assertEqual(coordinate.worker(root), 0)
+        configuration = coordinate.read_json(root / "results/rpc-configuration.json")
+        configuration["effective"]["thinking"] = "low"
+        dump(root / "results/rpc-configuration.json", configuration)
+        worker = coordinate.read_json(root / "results/worker-receipt.json")
+        worker["configuration"] = configuration
+        worker["artifact_sha256"] = {name: coordinate.digest(raw) for name, raw in coordinate.snapshot(root / "results").items() if name != "worker-receipt.json"}
+        dump(root / "results/worker-receipt.json", worker)
+        task = coordinate.read_json(root / "task.json")
+        with self.assertRaises(ValueError): coordinate.verify_return(root / "results", task, {"answer.txt": b"before\n"}, "run-one")
+        with self.assertRaises(ValueError): coordinate.verify_recovered_artifacts(root / "results", task, {"answer.txt": b"before\n"})
+
+
 class RecoveryChangeTests(unittest.TestCase):
     setUp = WorkerTests.setUp
     prepare = WorkerTests.prepare
+
+    def test_historical_v1_inputs_and_failed_artifacts_remain_recoverable(self):
+        root = self.prepare(name="a" * 32, checks=[{"name": "failed", "argv": [sys.executable, "-c", "raise SystemExit(9)"], "timeout_seconds": 2}])
+        task = coordinate.read_json(root / "task.json")
+        task["run_id"] = root.name
+        task["source"]["modes"] = {"answer.txt": 0o644}
+        task["allowed_tools"] = sorted(coordinate.TOOLS)
+        dump(root / "task.json", task)
+        self.assertEqual(coordinate.worker(root), 1)
+        payload = {"task.json": json.dumps(task).encode(), "launch.json": (root / "launch.json").read_bytes(), "coordinate.py": b"# retained version one worker", "extension.js": b"// retained version one extension", "package.json": b'{"type":"module"}', "workspace/answer.txt": b"before\n"}
+        archive = make_archive([(name, raw, tarfile.REGTYPE) for name, raw in payload.items()])
+        (root / "inputs.tar").write_bytes(archive)
+        original = {"version": 1, "run_id": root.name, "task_id": task["task_id"], "kind": task["kind"], "started_at": "2000-01-01T00:00:00Z", "source": task["source"], "input_sha256": coordinate.digest(archive), "remote_artifacts": str(root / "results"), "delivery_valid": False}
+        dump(root / "started.json", original); dump(root / "receipt.json", original)
+        profile = {"remote_parent": str(self.root)}
+        before = {name: (root / name).read_bytes() for name in ["started.json", "receipt.json", "inputs.tar"]}
+        _original, retained_task, source, _hashes = coordinate.recovery_inputs(root, profile)
+        self.assertEqual(retained_task, task)
+        recovered = coordinate.verify_recovered_artifacts(root / "results", retained_task, source)
+        self.assertEqual(recovered["evidence_status"], "complete")
+        self.assertEqual(recovered["worker_outcome"], "failed")
+        self.assertEqual(recovered["checks"][0]["exit_code"], 9)
+        self.assertEqual(before, {name: (root / name).read_bytes() for name in before})
 
     def test_failed_check_change_bindings_remain_strict(self):
         check = {'name': 'proof', 'argv': [sys.executable, '-c', 'raise SystemExit(9)'], 'timeout_seconds': 2}
@@ -476,7 +959,7 @@ class OwnerTests(unittest.TestCase):
                         "pi_argv": [sys.executable, str(self.root / "fake-pi.py"), "unchanged"],
                         "model": "example/model", "remote_parent": str(self.root / "remote"),
                         "python": sys.executable, "protected_sandboxes": ["protected"]}
-        (self.root / "fake-pi.py").write_text(FAKE_PI)
+        (self.root / "fake-pi.py").write_text(FAKE_RPC)
         (self.root / "fake-exec.py").write_text(FAKE_EXEC)
         self.profile["openshell_argv"] = [sys.executable, str(self.root / "fake-exec.py")]
         self.profile_path = self.root / "profile.json"; dump(self.profile_path, self.profile)
@@ -537,6 +1020,20 @@ class OwnerTests(unittest.TestCase):
         self.assertEqual(receipt["acceptance"], "not_granted")
         self.assertEqual(self.instances[0].calls.count("start"), 1)
         self.assertEqual(self.instances[0].calls.count("stop"), 1)
+
+    def test_registered_default_supports_capabilities_and_run_without_profile_flag(self):
+        with mock.patch.object(Path, "home", return_value=self.root), mock.patch.object(coordinate, "OpenShellOwner", self.factory()), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(coordinate.main(["configure", "--profile", str(self.profile_path)]), 0)
+            default = self.root / ".config/codex-pi-coordination/profile.json"
+            original = default.read_bytes()
+            self.assertEqual(coordinate.main(["capabilities", "--output", str(self.root / "metadata")]), 0)
+            metadata = coordinate.read_json(self.root / "metadata/receipt.json")
+            self.assertTrue(metadata["capabilities_valid"])
+            self.assertFalse(metadata["delivery_valid"])
+            self.assertTrue(metadata["cleanup_complete"])
+            self.assertEqual(coordinate.main(["run", str(self.task_path), "--output", str(self.root / "default-run")]), 0)
+            self.assertTrue(coordinate.read_json(self.root / "default-run/receipt.json")["delivery_valid"])
+            self.assertEqual(default.read_bytes(), original)
 
     def test_identity_or_ready_refusal_has_no_lifecycle_side_effect(self):
         for mode in ["initial-wrong-id", "initial-ready"]:
@@ -696,6 +1193,47 @@ class RecoveryTests(unittest.TestCase):
     def recover(self, mode='normal', output='recovered'):
         with mock.patch.object(coordinate, 'OpenShellOwner', self.recovery_factory(mode)):
             return coordinate.recover_task(self.root / 'out', self.profile_path, self.root / output, self.root / 'locks')
+
+    def test_legacy_bare_model_profile_reconciles_and_recovers_v1_without_execution(self):
+        for index, model in enumerate(["llm.primary", "sonnet:high"]):
+            with self.subTest(model=model):
+                self.profile["model"] = model; dump(self.profile_path, self.profile)
+                run_id = format(index + 1, "032x")
+                remote = Path(self.profile["remote_parent"]) / run_id
+                results = remote / "results"; results.mkdir(parents=True)
+                source = {"kind": "empty-workspace", "files": {}, "modes": {}}
+                check = {"name": "never-run", "argv": [sys.executable, "-c", "raise AssertionError('Recovery cannot execute checks')"], "timeout_seconds": 2}
+                native = {"version": 1, "run_id": run_id, "task_id": "legacy-task", "kind": "validation", "instructions": "Retained legacy task", "workspace": str(remote / "workspace"), "output_directory": str(results), "writable_paths": [], "allowed_tools": sorted(coordinate.TOOLS - {"write", "edit"}), "max_tool_calls": 10, "max_turns": 10, "source": source, "checks": [check]}
+                launch = {"model": model, "thinking": "high", "checks": [check]}
+                payload = {"task.json": json.dumps(native).encode(), "launch.json": json.dumps(launch).encode(), "coordinate.py": b"# retained v1 worker", "extension.js": b"// retained v1 extension", "package.json": b'{"type":"module"}'}
+                archive = make_archive([(name, raw, tarfile.REGTYPE) for name, raw in payload.items()])
+                failed = self.root / f"legacy-{index}"; failed.mkdir()
+                (failed / "inputs.tar").write_bytes(archive)
+                stopped = {"id": "sandbox-id", "name": "disposable", "phase": "Stopped", "main_process_instance_id": "legacy-main", "restart_count": 0}
+                original = {"version": 1, "run_id": run_id, "task_id": "legacy-task", "kind": "validation", "started_at": "2000-01-01T00:00:00Z", "source": source, "input_sha256": coordinate.digest(archive), "remote_artifacts": str(results), "delivery_valid": False, "cleanup_complete": False, "sandbox_running": {**stopped, "phase": "Ready"}, "sandbox_after": stopped}
+                dump(failed / "started.json", original); dump(failed / "receipt.json", original)
+                dump(results / "worker-receipt.json", {"version": 1, "run_id": run_id, "task_id": "legacy-task", "outcome": "incomplete", "pi_exit_code": 7})
+                locks = self.root / "locks"; locks.mkdir(exist_ok=True)
+                journal = locks / (coordinate.digest(b"sandbox-id") + ".json"); dump(journal, original)
+                preserved = {path: path.read_bytes() for path in [self.profile_path, failed / "started.json", failed / "receipt.json", failed / "inputs.tar"]}
+                reconcile = ["reconcile", "--profile", str(self.profile_path), "--lock-root", str(locks)]
+                before = journal.read_bytes()
+                with mock.patch.object(coordinate, "OpenShellOwner", self.recovery_factory("initial-wrong-main")), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(coordinate.main(reconcile), 1)
+                self.assertEqual(journal.read_bytes(), before)
+                with mock.patch.object(coordinate, "OpenShellOwner", self.recovery_factory()), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(coordinate.main(reconcile), 0)
+                self.assertEqual(self.instances[-1].calls, [])
+                output = self.root / f"recovered-legacy-{index}"
+                with mock.patch.object(coordinate, "OpenShellOwner", self.recovery_factory()), mock.patch.object(coordinate, "execute_to_log", side_effect=AssertionError("Recovery cannot run Pi or checks")), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(coordinate.main(["recover", str(failed), "--profile", str(self.profile_path), "--output", str(output), "--lock-root", str(locks)]), 0)
+                recovered = coordinate.read_json(output / "receipt.json")
+                self.assertTrue(recovered["recovery_valid"])
+                self.assertFalse(recovered["delivery_valid"]); self.assertFalse(recovered["task_delivery_valid"])
+                self.assertEqual(recovered["outcome"], "recovered_partial")
+                self.assertEqual(recovered["evidence"]["checks"], [{"name": "never-run", "state": "unknown", "exit_code": None}])
+                self.assertEqual(self.instances[-1].calls, ["start", "download", "stop"])
+                self.assertEqual(preserved, {path: path.read_bytes() for path in preserved})
 
     def test_nonzero_check_recovers_without_reexecution_or_task_success(self):
         original = self.failed_run()

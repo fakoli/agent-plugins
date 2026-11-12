@@ -32,6 +32,7 @@ function runtime(taskPath, cwd, allowedTools) {
     registerCommand: (name, command) => commands.set(name, command),
     on: (name, handler) => handlers.set(name, handler),
     getActiveTools: () => active,
+    getThinkingLevel: () => ctx.thinking ?? "high",
     setActiveTools: (names) => { active = allowedTools ? names.filter((name) => allowedTools.includes(name)) : names; },
   };
   extension(pi);
@@ -50,6 +51,111 @@ function runtime(taskPath, cwd, allowedTools) {
 
 const handoff = (changed_files = []) => ({ status: "completed", summary: "Inspected the provided fixture.", evidence: ["input.txt"], changed_files, limitations: ["Model self-report; external checks remain required."] });
 const events = (f) => fs.readFileSync(path.join(f.output, "extension-events.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
+
+test("versioned task IDs preserve legacy native run IDs and reject unsupported options", async (t) => {
+  for (const version of [1, 2]) {
+    const maximum = version === 1 ? 80 : 128;
+    const base = { version, ...(version === 2 ? { operation: "run", run_options: {}, runtime_defaults: { model: "fixture-provider/fixture-model", thinking: "high" } } : {}) };
+    const f = fixture(t, { ...base, task_id: "t".repeat(maximum), run_id: "run:" + "r".repeat(124) });
+    assert.equal(loadTask(f.taskPath, f.workspace).task.run_id.length, 128);
+    const r = runtime(f.taskPath, f.workspace);
+    await r.emit("session_start");
+    assert.ok((await r.emit("before_agent_start", { systemPrompt: "original" })).systemPrompt);
+    assert.equal(r.ctx.aborted, 0);
+    await r.emit("session_shutdown");
+    for (const [field, invalid] of [["task_id", "t".repeat(maximum + 1)], ["task_id", "task-one\n"], ["task_id", "task-one\r\n"], ["run_id", "r".repeat(129)], ["run_id", "run-one\n"], ["run_id", "run-one\r\n"]]) {
+      const invalidFixture = fixture(t, { ...base, [field]: invalid });
+      assert.throws(() => loadTask(invalidFixture.taskPath, invalidFixture.workspace), new RegExp(field));
+    }
+    const namespaced = fixture(t, { ...base, task_id: "project:T001" });
+    if (version === 1) {
+      assert.throws(() => loadTask(namespaced.taskPath, namespaced.workspace), /task_id/);
+      for (const run_options of [{}, { thinking: "low" }, null]) {
+        const invalidFixture = fixture(t, { ...base, run_options });
+        assert.throws(() => loadTask(invalidFixture.taskPath, invalidFixture.workspace), /run_options/);
+      }
+    } else {
+      assert.equal(loadTask(namespaced.taskPath, namespaced.workspace).task.task_id, "project:T001");
+    }
+  }
+});
+
+test("v2 binds namespaced scope and actual options before model work", async (t) => {
+  const f = fixture(t, { version: 2, task_id: "project:T001", operation: "run", run_options: { thinking: "low" }, runtime_defaults: { model: "fixture-provider/fixture-model", thinking: "high" } });
+  const r = runtime(f.taskPath, f.workspace);
+  r.ctx.thinking = "low";
+  await r.emit("session_start");
+  await r.emit("before_agent_start", { systemPrompt: "original" });
+  await r.emit("before_agent_start", { systemPrompt: "original" });
+  assert.deepEqual(events(f).map((event) => event.type), ["task_loaded", "run_configuration"]);
+  assert.deepEqual(events(f)[1].configuration, { provider: "fixture-provider", model: "fixture-model", thinking: "low" });
+  await r.emit("session_shutdown");
+});
+
+test("v2 rejects malformed options and mismatched effective model or thinking", async (t) => {
+  const base = { version: 2, operation: "run", run_options: {}, runtime_defaults: { model: "fixture-provider/fixture-model", thinking: "high" } };
+  for (const run_options of [{ model: "unpaired" }, { provider: "unpaired" }, { thinking: "auto" }, { thinking: "dynamic" }, { thinking: "default" }, { extra: "value" }]) {
+    const f = fixture(t, { ...base, run_options });
+    assert.throws(() => loadTask(f.taskPath, f.workspace), /run options/);
+  }
+  for (const changes of [{ model: { provider: "foreign", id: "model" } }, { thinking: "low" }]) {
+    const f = fixture(t, base);
+    const r = runtime(f.taskPath, f.workspace);
+    Object.assign(r.ctx, changes);
+    await r.emit("session_start");
+    assert.equal(await r.emit("before_agent_start", { systemPrompt: "original" }), undefined);
+    assert.equal(r.ctx.aborted, 1);
+    assert.equal(events(f).at(-1).code, "configuration_mismatch");
+    assert.equal(fs.existsSync(path.join(f.output, "model-report.json")), false);
+    await r.emit("session_shutdown");
+  }
+});
+
+test("explicit provider and model identifiers remain separate across slash boundaries", async (t) => {
+  for (const actual of [{ provider: "one", id: "two/three" }, { provider: "one/two", id: "three" }]) {
+    const f = fixture(t, { version: 2, operation: "run", run_options: { provider: "one/two", model: "three" }, runtime_defaults: { model: "one/two/three", thinking: "high" } });
+    const r = runtime(f.taskPath, f.workspace);
+    r.ctx.model = actual;
+    await r.emit("session_start");
+    const prompt = await r.emit("before_agent_start", { systemPrompt: "original" });
+    if (actual.provider === "one/two") {
+      assert.ok(prompt.systemPrompt);
+      assert.equal(events(f).at(-1).type, "run_configuration");
+    } else {
+      assert.equal(prompt, undefined);
+      assert.equal(r.ctx.aborted, 1);
+      assert.equal(events(f).at(-1).code, "configuration_mismatch");
+    }
+    await r.emit("session_shutdown");
+  }
+});
+
+test("qualified defaults load and reach the pre-prompt guard at both component bounds", async (t) => {
+  for (const [provider, id] of [["fixture-provider", "fixture-model"], ["p", "m".repeat(255)], ["p".repeat(256), "m".repeat(256)], ["a/" + "b".repeat(254), "c/" + "d".repeat(254)]]) {
+    const f = fixture(t, { version: 2, operation: "run", run_options: {}, runtime_defaults: { model: `${provider}/${id}`, thinking: "high" } });
+    assert.equal(loadTask(f.taskPath, f.workspace).task.runtime_defaults.model, `${provider}/${id}`);
+    const r = runtime(f.taskPath, f.workspace);
+    r.ctx.model = { provider, id };
+    await r.emit("session_start");
+    assert.ok((await r.emit("before_agent_start", { systemPrompt: "original" })).systemPrompt);
+    assert.equal(r.ctx.aborted, 0);
+    assert.deepEqual(events(f).at(-1).configuration, { provider, model: id, thinking: "high" });
+    await r.emit("session_shutdown");
+  }
+});
+
+test("qualified defaults reject malformed or overlong components without relaxing explicit options", (t) => {
+  const base = { version: 2, operation: "run", run_options: {}, runtime_defaults: { model: "p/m", thinking: "high" } };
+  for (const model of [null, "", "bare", "p/", "/m", "_p/m", "p/_m", "https://example/model", "p/m\n", "p/m\r\n", "p/bad model", "p".repeat(257) + "/m", "p/" + "m".repeat(257), "p".repeat(256) + "/" + "m".repeat(257)]) {
+    const f = fixture(t, { ...base, runtime_defaults: { model, thinking: "high" } });
+    assert.throws(() => loadTask(f.taskPath, f.workspace), /runtime defaults/);
+    assert.deepEqual(fs.readdirSync(f.output), []);
+  }
+  for (const run_options of [{ provider: "p".repeat(257), model: "m" }, { provider: "p", model: "m".repeat(257) }, { provider: "p\n", model: "m" }, { provider: "p", model: "m\n" }]) {
+    const f = fixture(t, { ...base, run_options });
+    assert.throws(() => loadTask(f.taskPath, f.workspace), /run options/);
+  }
+});
 
 test("each task kind injects context and returns a bound self-report without acceptance", async (t) => {
   for (const kind of ["implementation", "research", "review", "validation"]) {
