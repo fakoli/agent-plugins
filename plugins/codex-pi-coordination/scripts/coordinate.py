@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import selectors
 import signal
 import stat
 import subprocess
@@ -31,6 +32,7 @@ MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_FILES = 10000
 KINDS = {"implementation", "research", "review", "validation"}
 TOOLS = {"read", "grep", "find", "ls", "write", "edit"}
+THINKING_LEVELS = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 PLUGIN = Path(__file__).resolve().parents[1]
 
 
@@ -73,12 +75,16 @@ def relative_file(value):
 def validate_task(task):
     required = {"version", "task_id", "kind", "instructions", "writable_paths", "checks"}
     optional = {"repository", "revision", "max_tool_calls", "max_turns", "wall_seconds"}
+    if isinstance(task, dict) and type(task.get("version")) is int and task["version"] == 2:
+        optional.add("run_options")
     if not isinstance(task, dict) or set(task) - required - optional or required - set(task):
-        raise ValueError("Task fields do not match the version 1 contract")
-    if type(task["version"]) is not int or task["version"] != 1 or not isinstance(task["kind"], str) or task["kind"] not in KINDS:
+        raise ValueError("Task fields do not match the versioned contract")
+    if type(task["version"]) is not int or task["version"] not in (1, 2) or not isinstance(task["kind"], str) or task["kind"] not in KINDS:
         raise ValueError("Unsupported task version or kind")
-    if not isinstance(task["task_id"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", task["task_id"]):
+    pattern = r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}" if task["version"] == 2 else r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}"
+    if not isinstance(task["task_id"], str) or not re.fullmatch(pattern, task["task_id"]):
         raise ValueError("Invalid task_id")
+    validate_run_options(task.get("run_options", {}))
     if not isinstance(task["instructions"], str) or not 1 <= len(task["instructions"].encode()) <= 32000:
         raise ValueError("Instructions must contain 1..32000 bytes")
     paths = task["writable_paths"]
@@ -105,6 +111,23 @@ def validate_task(task):
     if "repository" in task and (not isinstance(task["repository"], str) or not task["repository"]):
         raise ValueError("repository must be a path string")
     return task
+
+
+def model_identifier(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}", value) or "://" in value:
+        raise ValueError("Expected a bounded model identifier, not a URL or command")
+    return value
+
+
+def validate_run_options(options):
+    if not isinstance(options, dict) or set(options) - {"provider", "model", "thinking"} or (("provider" in options) != ("model" in options)):
+        raise ValueError("run_options requires a provider/model pair and optional thinking")
+    for key in ("provider", "model"):
+        if key in options:
+            model_identifier(options[key])
+    if "thinking" in options and (not isinstance(options["thinking"], str) or options["thinking"] not in THINKING_LEVELS):
+        raise ValueError("Unsupported thinking selection; omit it to inherit the profile")
+    return options
 
 
 def safe_archive_files(raw):
@@ -232,7 +255,12 @@ def inspect_extension_events(path, task, pi_events, task_sha256):
     kinds = [event.get("type") for event in events]
     if kinds[0] != "task_loaded" or kinds.count("task_loaded") != 1 or kinds.count("handoff") != 1 or kinds.count("agent_settled") != 1 or kinds.count("session_shutdown") != 1 or kinds[-2:] != ["agent_settled", "session_shutdown"]:
         raise ValueError("Incomplete or unordered extension lifecycle")
-    if set(kinds) - {"task_loaded", "tool_call", "handoff", "agent_settled", "session_shutdown"} or any(event.get("failure") for event in events):
+    allowed_kinds = {"task_loaded", "tool_call", "handoff", "agent_settled", "session_shutdown"}
+    if task["version"] == 2:
+        allowed_kinds.add("run_configuration")
+        if kinds.count("run_configuration") != 1 or kinds[1] != "run_configuration":
+            raise ValueError("Missing or unordered extension run configuration")
+    if set(kinds) - allowed_kinds or any(event.get("failure") for event in events):
         raise ValueError("Extension refused the delegated task")
     for event in events:
         if event.get("run_id") != task["run_id"] or event.get("task_id") != task["task_id"] or event.get("task_sha256") != task_sha256:
@@ -256,7 +284,349 @@ def inspect_extension_events(path, task, pi_events, task_sha256):
     # The final assistant response follows the handoff tool in a new turn.
     if not 1 <= events[handoff_index]["turns"] <= pi_events["assistant_turns"] or any(event["turns"] != pi_events["assistant_turns"] for event in events[-2:]):
         raise ValueError("Extension turn accounting differs from Pi")
-    return {"event_log_sha256": digest(raw), "model": events[0].get("model"), "tool_calls": len(calls), "assistant_turns": pi_events["assistant_turns"]}
+    result = {"event_log_sha256": digest(raw), "model": events[0].get("model"), "tool_calls": len(calls), "assistant_turns": pi_events["assistant_turns"]}
+    if task["version"] == 2:
+        result["configuration"] = validate_run_options(events[1].get("configuration"))
+        if set(result["configuration"]) != {"provider", "model", "thinking"}:
+            raise ValueError("Incomplete extension run configuration")
+    return result
+
+
+RPC_PROMPT = "Complete the assigned coordination task. Use coordination_status to inspect it and coordination_handoff to return your work. Do not execute verification commands; the coordinator runs declared checks after your handoff."
+
+
+def rpc_model(value):
+    if not isinstance(value, dict):
+        raise ValueError("Missing RPC model identity")
+    return {"provider": model_identifier(value.get("provider")), "id": model_identifier(value.get("id"))}
+
+
+def rpc_data(command, data):
+    """Discard model API objects, headers, URLs and free-form error messages."""
+    if command == "get_available_models":
+        if not isinstance(data, dict) or not isinstance(data.get("models"), list) or len(data["models"]) > 1000:
+            raise ValueError("Invalid RPC model catalog")
+        models = [rpc_model(model) for model in data["models"]]
+        if len({(model["provider"], model["id"]) for model in models}) != len(models):
+            raise ValueError("Duplicate RPC model identity")
+        return {"models": models}
+    if command == "get_available_thinking_levels":
+        levels = data.get("levels") if isinstance(data, dict) else None
+        if not isinstance(levels, list) or not levels or any(not isinstance(level, str) or level not in THINKING_LEVELS for level in levels) or len(set(levels)) != len(levels):
+            raise ValueError("Invalid RPC thinking capabilities")
+        return {"levels": levels}
+    if command == "get_state":
+        if not isinstance(data, dict) or any(type(data.get(key)) is not bool for key in ("isStreaming", "isCompacting")) or type(data.get("pendingMessageCount")) is not int or data["pendingMessageCount"] < 0:
+            raise ValueError("Invalid RPC state")
+        if data.get("sessionFile") is not None or not isinstance(data.get("sessionId"), str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", data["sessionId"]):
+            raise ValueError("RPC must use an exact nonpersistent session")
+        thinking = data.get("thinkingLevel")
+        if not isinstance(thinking, str) or thinking not in THINKING_LEVELS:
+            raise ValueError("Invalid effective thinking level")
+        return {"model": rpc_model(data.get("model")), "thinkingLevel": thinking,
+                "isStreaming": data["isStreaming"], "isCompacting": data["isCompacting"],
+                "pendingMessageCount": data["pendingMessageCount"], "sessionId": data["sessionId"], "sessionFile": None}
+    if command == "set_model":
+        return rpc_model(data)
+    if command in {"set_thinking_level", "prompt"}:
+        return None
+    raise ValueError("Unexpected RPC command")
+
+
+class PiRpc:
+    """One bounded stdlib RPC child; OpenShell remains its lifecycle owner."""
+    def __init__(self, command, workspace, output, deadline, env):
+        self.deadline, self.output = deadline, output
+        self.pending, self.responses, self.records = {}, {}, []
+        self.sequence, self.bytes_seen, self.settled = 0, 0, 0
+        self.prompt_sent, self.stdin_closed = False, False
+        self.buffer, self.outgoing = b"", b""
+        self.selector = selectors.DefaultSelector()
+        self.events = (output / "pi-events.jsonl").open("xb")
+        self.stderr = (output / "pi-stderr.log").open("xb")
+        self.control = (output / "rpc-events.jsonl").open("x", encoding="utf-8")
+        self.process = subprocess.Popen(command, cwd=workspace, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+        for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+            os.set_blocking(stream.fileno(), False)
+        self.selector.register(self.process.stdout, selectors.EVENT_READ, "stdout")
+        self.selector.register(self.process.stderr, selectors.EVENT_READ, "stderr")
+
+    def record(self, value):
+        self.records.append(value)
+        if len(self.records) > 10000:
+            raise ValueError("RPC record count exceeded")
+        self.control.write(json.dumps(value, ensure_ascii=True) + "\n")
+        self.control.flush()
+        if self.control.tell() > MAX_OUTPUT_BYTES:
+            raise ValueError("RPC control output exceeded")
+
+    def send(self, command, **arguments):
+        self.sequence += 1
+        request_id = f"request-{self.sequence}"
+        if command == "prompt":
+            if self.prompt_sent:
+                raise ValueError("A run permits exactly one prompt")
+            self.prompt_sent = True
+        self.pending[request_id] = command
+        retained = {"message_sha256": digest(arguments["message"].encode())} if command == "prompt" else arguments
+        self.record({"type": "request", "id": request_id, "command": command, "arguments": retained})
+        self.outgoing += (json.dumps({"id": request_id, "type": command, **arguments}) + "\n").encode()
+        try:
+            self.selector.register(self.process.stdin, selectors.EVENT_WRITE, "stdin")
+        except KeyError:
+            pass
+        return request_id
+
+    def consume(self, raw):
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, ValueError):
+            raise ValueError("Malformed Pi RPC JSONL") from None
+        if not isinstance(value, dict) or not isinstance(value.get("type"), str):
+            raise ValueError("Malformed Pi RPC record")
+        if value["type"] == "response":
+            request_id = value.get("id")
+            if not isinstance(request_id, str) or request_id not in self.pending or value.get("command") != self.pending[request_id]:
+                raise ValueError("Unmatched or duplicate RPC response")
+            command = self.pending.pop(request_id)
+            if value.get("success") is not True:
+                self.record({"type": "response", "id": request_id, "command": command, "success": False})
+                raise ValueError("Pi RPC command refused: " + command)
+            safe = rpc_data(command, value.get("data"))
+            self.record({"type": "response", "id": request_id, "command": command, "success": True, "data": safe})
+            self.responses[request_id] = safe
+            return
+        if not self.prompt_sent or value["type"] in {"extension_ui_request", "error"}:
+            raise ValueError("Unexpected activity outside the approved task prompt")
+        if value["type"] == "agent_settled":
+            self.settled += 1
+            if self.settled != 1:
+                raise ValueError("Unexpected repeated RPC settlement")
+            self.record({"type": "event", "event": "agent_settled"})
+        self.events.write(json.dumps(value, ensure_ascii=True).encode() + b"\n")
+        self.events.flush()
+        if self.events.tell() > MAX_OUTPUT_BYTES:
+            raise ValueError("Pi event output exceeded")
+
+    def pump(self):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise ValueError("Pi RPC deadline exceeded")
+        for key, _mask in self.selector.select(min(0.1, remaining)):
+            if key.data == "stdin":
+                try:
+                    count = os.write(key.fd, self.outgoing)
+                except BrokenPipeError:
+                    raise ValueError("Pi RPC stdin closed before acknowledgement") from None
+                self.outgoing = self.outgoing[count:]
+                if not self.outgoing:
+                    self.selector.unregister(key.fileobj)
+                continue
+            raw = os.read(key.fd, 65536)
+            if not raw:
+                self.selector.unregister(key.fileobj)
+                if key.data == "stdout" and self.buffer:
+                    raise ValueError("Partial Pi RPC JSONL at EOF")
+                continue
+            self.bytes_seen += len(raw)
+            if self.bytes_seen > MAX_OUTPUT_BYTES:
+                raise ValueError("Pi RPC aggregate output exceeded")
+            if key.data == "stderr":
+                self.stderr.write(raw)
+                self.stderr.flush()
+            else:
+                self.buffer += raw
+                while b"\n" in self.buffer:
+                    line, self.buffer = self.buffer.split(b"\n", 1)
+                    self.consume(line.removesuffix(b"\r"))
+        if self.process.poll() is not None and not self.selector.get_map() and not self.stdin_closed:
+            raise ValueError("Pi RPC exited before orderly shutdown")
+
+    def wait(self, request_id):
+        while request_id not in self.responses:
+            self.pump()
+        return self.responses[request_id]
+
+    def call(self, command, **arguments):
+        return self.wait(self.send(command, **arguments))
+
+    def finish(self):
+        if self.pending or self.outgoing:
+            raise ValueError("RPC has unacknowledged commands")
+        self.stdin_closed = True
+        self.record({"type": "stdin_closed"})
+        self.process.stdin.close()
+        while self.process.poll() is None or self.selector.get_map():
+            self.pump()
+        if self.process.wait() != 0:
+            raise ValueError("Pi RPC exited unsuccessfully")
+        self.record({"type": "exit", "exit_code": 0})
+
+    def close(self):
+        # On error EOF is best effort, never proof of remote cleanup. The host
+        # immediately enters its existing managed OpenShell stop path.
+        if not self.process.stdin.closed:
+            self.process.stdin.close()
+        try:
+            self.process.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            pass
+        self.selector.close()
+        for stream in (self.process.stdout, self.process.stderr, self.events, self.stderr, self.control):
+            stream.close()
+
+
+def desired_configuration(task, models):
+    requested = validate_run_options(task["run_options"])
+    defaults = task["runtime_defaults"]
+    if not isinstance(defaults, dict) or set(defaults) != {"model", "thinking"} or not isinstance(defaults["model"], str) or not isinstance(defaults["thinking"], str) or defaults["thinking"] not in THINKING_LEVELS:
+        raise ValueError("Invalid bound runtime defaults")
+    if "provider" in requested:
+        candidates = [model for model in models if model["provider"] == requested["provider"] and model["id"] == requested["model"]]
+    else:
+        candidates = [model for model in models if model["provider"] + "/" + model["id"] == defaults["model"]]
+    if len(candidates) != 1:
+        raise ValueError("Requested model is unavailable or ambiguous")
+    return {"provider": candidates[0]["provider"], "model": candidates[0]["id"], "thinking": requested.get("thinking", defaults["thinking"])}
+
+
+def require_rpc_idle(state, effective=None, session_id=None):
+    if state["isStreaming"] or state["isCompacting"] or state["pendingMessageCount"] != 0:
+        raise ValueError("Pi RPC is not idle with an empty queue")
+    actual = {"provider": state["model"]["provider"], "model": state["model"]["id"], "thinking": state["thinkingLevel"]}
+    if (effective is not None and actual != effective) or (session_id is not None and state["sessionId"] != session_id):
+        raise ValueError("Pi effective model/thinking/session differs from the approved selection")
+
+
+def rpc_configuration_record(task, models, levels, effective, session_id, results):
+    task_run = task["operation"] == "run"
+    return {"version": 1, "operation": task["operation"], "requested": task["run_options"],
+            "defaults": task["runtime_defaults"], "available_models": models,
+            "supported_thinking_levels": levels, "effective": effective,
+            "session_id": session_id, "session_file": None, "prompt_sent": task_run,
+            "settled": task_run, "shutdown": "stdin-eof",
+            "rpc_log_sha256": digest((results / "rpc-events.jsonl").read_bytes()),
+            "stderr_sha256": digest((results / "pi-stderr.log").read_bytes())}
+
+
+def run_rpc(root, task, launch, deadline, env):
+    metadata = task["operation"] == "capabilities"
+    command = [*launch["pi_argv"], "--offline", "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve", "--tools", "" if metadata else ",".join([*task["allowed_tools"], "coordination_status", "coordination_handoff"]), "--mode", "rpc"]
+    if not metadata:
+        command += ["--extension", str(root / "extension.js"), "--coordination-task", str(root / "task.json")]
+    rpc = PiRpc(command, root / "workspace", root / "results", deadline, env)
+    try:
+        models_request = rpc.send("get_available_models")
+        initial_request = rpc.send("get_state")
+        models = rpc.wait(models_request)["models"]
+        initial = rpc.wait(initial_request)
+        require_rpc_idle(initial)
+        effective = desired_configuration(task, models)
+        model_changed = initial["model"] != {"provider": effective["provider"], "id": effective["model"]}
+        if model_changed:
+            selected = rpc.call("set_model", provider=effective["provider"], modelId=effective["model"])
+            if selected != {"provider": effective["provider"], "id": effective["model"]}:
+                raise ValueError("Pi selected a different model")
+        levels = rpc.call("get_available_thinking_levels")["levels"]
+        if effective["thinking"] not in levels:
+            raise ValueError("Selected model does not support requested thinking")
+        if model_changed or initial["thinkingLevel"] != effective["thinking"]:
+            rpc.call("set_thinking_level", level=effective["thinking"])
+        admitted = rpc.call("get_state")
+        require_rpc_idle(admitted, effective, initial["sessionId"])
+        if not metadata:
+            rpc.call("prompt", message=RPC_PROMPT)
+            while not rpc.settled:
+                rpc.pump()
+            require_rpc_idle(rpc.call("get_state"), effective, initial["sessionId"])
+        rpc.finish()
+        configuration = rpc_configuration_record(task, models, levels, effective, initial["sessionId"], root / "results")
+        write_new_json(root / "results/rpc-configuration.json", configuration)
+        return configuration
+    except Exception as error:
+        if rpc.process.poll() is not None:
+            error.pi_exit_code = rpc.process.returncode
+        raise
+    finally:
+        rpc.close()
+
+
+def verify_rpc_configuration(results, task):
+    """Reconstruct configuration from sanitized control records and bound input."""
+    raw = (results / "rpc-events.jsonl").read_bytes()
+    if len(raw) > MAX_OUTPUT_BYTES:
+        raise ValueError("RPC transcript exceeds bounds")
+    records = [json.loads(line) for line in raw.split(b"\n") if line]
+    if not records or len(records) > 10000 or records[-2:] != [{"type": "stdin_closed"}, {"type": "exit", "exit_code": 0}]:
+        raise ValueError("RPC transcript lacks orderly shutdown")
+    requests, responses, events = [], {}, []
+    for index, record in enumerate(records[:-2]):
+        if not isinstance(record, dict):
+            raise ValueError("Invalid RPC transcript record")
+        kind = record.get("type")
+        if kind == "request":
+            if set(record) != {"type", "id", "command", "arguments"} or record["id"] != f"request-{len(requests) + 1}" or not isinstance(record["arguments"], dict):
+                raise ValueError("Invalid RPC request binding")
+            requests.append((index, record))
+        elif kind == "response":
+            if set(record) != {"type", "id", "command", "success", "data"} or record["success"] is not True or not isinstance(record["id"], str) or record["id"] in responses:
+                raise ValueError("Invalid RPC response binding")
+            matched = [request for _position, request in requests if request["id"] == record["id"]]
+            if len(matched) != 1 or record["command"] != matched[0]["command"] or rpc_data(record["command"], record["data"]) != record["data"]:
+                raise ValueError("RPC response differs from its safe request contract")
+            responses[record["id"]] = (index, record["data"])
+        elif record == {"type": "event", "event": "agent_settled"}:
+            events.append(index)
+        else:
+            raise ValueError("Unknown RPC control record")
+    if len(requests) != len(responses) or len(requests) < 4:
+        raise ValueError("Incomplete RPC command sequence")
+    for number, (index, request) in enumerate(requests):
+        # Only the first two metadata queries may be outstanding together.
+        if number >= 2 and any(responses[prior["id"]][0] > index for _position, prior in requests[:number]):
+            raise ValueError("RPC admission precedes required acknowledgement")
+    def data(number):
+        if number >= len(requests):
+            raise ValueError("Incomplete RPC command sequence")
+        return responses[requests[number][1]["id"]][1]
+    if [request["command"] for _index, request in requests[:2]] != ["get_available_models", "get_state"]:
+        raise ValueError("RPC metadata preflight missing")
+    models, initial = data(0)["models"], data(1)
+    require_rpc_idle(initial)
+    effective = desired_configuration(task, models)
+    target_model = {"provider": effective["provider"], "id": effective["model"]}
+    changed = initial["model"] != target_model
+    expected = [("get_available_models", {}), ("get_state", {})]
+    if changed:
+        expected.append(("set_model", {"provider": effective["provider"], "modelId": effective["model"]}))
+        if data(2) != target_model:
+            raise ValueError("RPC returned the wrong selected model")
+    levels_index = len(expected)
+    expected.append(("get_available_thinking_levels", {}))
+    levels = data(levels_index)["levels"]
+    if effective["thinking"] not in levels:
+        raise ValueError("RPC selected unsupported thinking")
+    if changed or initial["thinkingLevel"] != effective["thinking"]:
+        expected.append(("set_thinking_level", {"level": effective["thinking"]}))
+    admitted_index = len(expected)
+    expected.append(("get_state", {}))
+    metadata = task["operation"] == "capabilities"
+    if not metadata:
+        expected += [("prompt", {"message_sha256": digest(RPC_PROMPT.encode())}), ("get_state", {})]
+    if [(request["command"], request["arguments"]) for _index, request in requests] != expected:
+        raise ValueError("RPC commands differ from approved options")
+    require_rpc_idle(data(admitted_index), effective, initial["sessionId"])
+    if metadata:
+        if events or (results / "pi-events.jsonl").read_bytes():
+            raise ValueError("Metadata discovery performed model activity")
+    else:
+        if len(events) != 1 or not requests[-2][0] < events[0] < requests[-1][0]:
+            raise ValueError("RPC completion did not settle before final state read")
+        require_rpc_idle(data(len(requests) - 1), effective, initial["sessionId"])
+    expected_configuration = rpc_configuration_record(task, models, levels, effective, initial["sessionId"], results)
+    if read_json(results / "rpc-configuration.json") != expected_configuration:
+        raise ValueError("RPC configuration receipt differs from actual control records")
+    return expected_configuration
 
 
 def worker(root):
@@ -264,7 +634,7 @@ def worker(root):
     root = Path(root).resolve(strict=True)
     task, launch = read_json(root / "task.json"), read_json(root / "launch.json")
     workspace, output = root / "workspace", root / "results"
-    receipt = {"version": 1, "run_id": task["run_id"], "task_id": task["task_id"], "started_at": utc_now(), "outcome": "incomplete", "checks": []}
+    receipt = {"version": task["version"], "run_id": task["run_id"], "task_id": task["task_id"], "started_at": utc_now(), "outcome": "incomplete", "checks": []}
     write_new_json(root / "worker-started.json", receipt)
     deadline = time.monotonic() + launch["wall_seconds"]
     before = snapshot(workspace)
@@ -275,11 +645,24 @@ def worker(root):
         env = os.environ.copy()
         env.update(launch["environment"])
         env["PYTHONDONTWRITEBYTECODE"] = "1"
-        receipt["pi_exit_code"] = execute_to_log(command, workspace, output / "pi-events.jsonl", deadline - time.monotonic(), remote_owner=True, env=env)
+        if task["version"] == 2:
+            receipt["configuration"] = run_rpc(root, task, launch, deadline, env)
+            receipt["pi_exit_code"] = 0
+            if task["operation"] == "capabilities":
+                if snapshot(workspace) != before:
+                    raise ValueError("Metadata discovery changed source")
+                receipt["outcome"] = "capabilities"
+                receipt["acceptance"] = "not_granted"
+                receipt["artifact_sha256"] = {name: digest(data) for name, data in snapshot(output).items()}
+                return 0
+        else:
+            receipt["pi_exit_code"] = execute_to_log(command, workspace, output / "pi-events.jsonl", deadline - time.monotonic(), remote_owner=True, env=env)
         if receipt["pi_exit_code"] != 0:
             raise ValueError("Pi exited unsuccessfully")
         receipt["events"] = inspect_events(output / "pi-events.jsonl", task["max_tool_calls"], task["max_turns"])
         receipt["extension"] = inspect_extension_events(output / "extension-events.jsonl", task, receipt["events"], digest((root / "task.json").read_bytes()))
+        if task["version"] == 2 and receipt["extension"].get("configuration") != receipt["configuration"]["effective"]:
+            raise ValueError("Extension effective options differ from RPC admission")
         report = read_json(output / "model-report.json")
         if report.get("run_id") != task["run_id"] or report.get("task_id") != task["task_id"] or report.get("model_self_report") is not True or report.get("task_sha256") != digest((root / "task.json").read_bytes()):
             raise ValueError("Model handoff identity mismatch")
@@ -325,6 +708,8 @@ def worker(root):
         receipt["acceptance"] = "not_granted"
         receipt["artifact_sha256"] = {name: digest(data) for name, data in snapshot(output).items()}
     except Exception as error:
+        if getattr(error, "pi_exit_code", None) is not None:
+            receipt["pi_exit_code"] = error.pi_exit_code
         receipt["error"] = str(error)
     finally:
         receipt["ended_at"] = utc_now()
@@ -342,8 +727,19 @@ def verify_return(results, task, source_files, run_id):
     observed_artifacts = {name: digest(data) for name, data in actual.items() if name != "worker-receipt.json"}
     if expected_artifacts != observed_artifacts:
         raise ValueError("Returned artifact manifest differs from actual bytes")
-    if receipt.get("run_id") != run_id or receipt.get("task_id") != task["task_id"] or receipt.get("outcome") != "returned" or type(receipt.get("pi_exit_code")) is not int or receipt["pi_exit_code"] != 0 or receipt.get("acceptance") != "not_granted":
+    if receipt.get("version") != task["version"]:
+        raise ValueError("Worker receipt version differs from task")
+    metadata = task.get("operation") == "capabilities"
+    if receipt.get("run_id") != run_id or receipt.get("task_id") != task["task_id"] or receipt.get("outcome") != ("capabilities" if metadata else "returned") or type(receipt.get("pi_exit_code")) is not int or receipt["pi_exit_code"] != 0 or receipt.get("acceptance") != "not_granted":
         raise ValueError("Worker identity or completion contract mismatch")
+    if task["version"] == 2:
+        configuration = verify_rpc_configuration(results, task)
+        if receipt.get("configuration") != configuration:
+            raise ValueError("Worker configuration differs from the verified RPC return")
+        if metadata:
+            if set(actual) != {"worker-receipt.json", "rpc-events.jsonl", "pi-events.jsonl", "pi-stderr.log", "rpc-configuration.json"} or task["writable_paths"] or task["checks"]:
+                raise ValueError("Metadata return contains task execution artifacts")
+            return receipt
     report = read_json(results / "model-report.json")
     if report.get("task_sha256") != digest(json.dumps(task).encode()) or report.get("task_id") != task["task_id"] or report.get("run_id") != run_id or report.get("model_self_report") is not True or report.get("status") != "completed":
         raise ValueError("Returned handoff does not bind this task")
@@ -355,6 +751,8 @@ def verify_return(results, task, source_files, run_id):
     extension = inspect_extension_events(results / "extension-events.jsonl", task, events, digest(json.dumps(task).encode()))
     if receipt.get("extension") != extension:
         raise ValueError("Recorded extension lifecycle differs from returned log")
+    if task["version"] == 2 and extension.get("configuration") != configuration["effective"]:
+        raise ValueError("Extension configuration differs from the verified RPC return")
     checks = receipt.get("checks")
     if not isinstance(checks, list) or len(checks) != len(task["checks"]):
         raise ValueError("Missing declared check result")
@@ -423,7 +821,7 @@ def profile_settings(path):
     protected = profile.get("protected_sandboxes", [])
     if not isinstance(protected, list) or any(not isinstance(name, str) or not name or name.startswith("-") for name in protected):
         raise ValueError("Invalid protected sandbox names")
-    if not isinstance(profile.get("thinking", "high"), str) or profile.get("thinking", "high") not in {"off", "minimal", "low", "medium", "high", "xhigh"}:
+    if not isinstance(profile.get("thinking", "high"), str) or profile.get("thinking", "high") not in THINKING_LEVELS:
         raise ValueError("Invalid thinking level")
     if not isinstance(profile.get("python", "python3"), str) or not profile.get("python", "python3") or "\x00" in profile.get("python", "python3"):
         raise ValueError("Invalid Python executable")
@@ -433,6 +831,38 @@ def profile_settings(path):
     if not remote_parent.is_absolute() or ".." in remote_parent.parts:
         raise ValueError("remote_parent must be an absolute sandbox path")
     return profile
+
+
+def configure_profile(source, destination=None):
+    """Register private settings without overwriting another default or provider."""
+    profile = profile_settings(source)
+    destination = Path(destination) if destination is not None else Path.home() / ".config/codex-pi-coordination/profile.json"
+    destination = destination.absolute()
+    for path in (destination, *destination.parents):
+        if path.is_symlink():
+            raise ValueError("Default profile path must not traverse symlinks")
+    missing = []
+    parent = destination.parent
+    while not parent.exists():
+        missing.append(parent)
+        parent = parent.parent
+    for parent in reversed(missing):
+        parent.mkdir(mode=0o700)
+    directory = destination.parent.stat()
+    if directory.st_uid != os.getuid() or stat.S_IMODE(directory.st_mode) != 0o700:
+        raise ValueError("Default profile directory must be owned and private (0700)")
+    if destination.exists():
+        current = destination.stat()
+        if current.st_uid != os.getuid() or stat.S_IMODE(current.st_mode) != 0o600 or profile_settings(destination) != profile:
+            raise ValueError("Existing default profile differs or is not private; preserved")
+        return {"configured": True, "changed": False, "runtime_verified": False}
+    descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+        json.dump(profile, output, indent=2)
+        output.write("\n")
+        output.flush()
+        os.fsync(output.fileno())
+    return {"configured": True, "changed": True, "runtime_verified": False}
 
 
 def selected_state(state):
@@ -516,8 +946,9 @@ def cleanup_owner(owner, profile, receipt, protected):
         receipt["protected_readback_error"] = str(error)
 
 
-def run_task(task_file, profile_file, output, lock_root):
-    task, profile = validate_task(read_json(task_file)), profile_settings(profile_file)
+def run_task(task_file, profile_file, output, lock_root, *, capabilities_only=False):
+    task = validate_task({"version": 2, "task_id": "capabilities", "kind": "validation", "instructions": "Inspect configured runtime metadata without model work.", "writable_paths": [], "checks": [], "wall_seconds": 30} if capabilities_only else read_json(task_file))
+    profile = profile_settings(profile_file)
     files, source = frozen_source(task)
     output = Path(output).absolute()
     output.mkdir(parents=True, exist_ok=False)
@@ -527,7 +958,7 @@ def run_task(task_file, profile_file, output, lock_root):
         raise ValueError("remote_parent must be an absolute sandbox path")
     remote = str(remote_parent / run_id)
     remote_archive = str(remote_parent.parent / ("codex-pi-" + run_id + ".tar"))
-    native_task = {"version": 1, "run_id": run_id, "task_id": task["task_id"], "kind": task["kind"], "instructions": task["instructions"], "workspace": remote + "/workspace", "output_directory": remote + "/results", "writable_paths": task["writable_paths"], "allowed_tools": sorted(TOOLS if task["writable_paths"] else TOOLS - {"write", "edit"}), "max_tool_calls": task.get("max_tool_calls", 40), "max_turns": task.get("max_turns", 32), "source": source, "checks": task["checks"]}
+    native_task = {"version": 2, "run_id": run_id, "task_id": task["task_id"], "kind": task["kind"], "instructions": task["instructions"], "workspace": remote + "/workspace", "output_directory": remote + "/results", "writable_paths": task["writable_paths"], "allowed_tools": sorted(TOOLS if task["writable_paths"] else TOOLS - {"write", "edit"}), "max_tool_calls": task.get("max_tool_calls", 40), "max_turns": task.get("max_turns", 32), "source": source, "checks": task["checks"], "operation": "capabilities" if capabilities_only else "run", "run_options": task.get("run_options", {}), "runtime_defaults": {"model": profile["model"], "thinking": profile.get("thinking", "high")}}
     if len(json.dumps(native_task).encode()) > 1024 * 1024:
         raise ValueError("Exported task manifest exceeds 1 MiB")
     launch = {"pi_argv": profile["pi_argv"], "model": profile["model"], "thinking": profile.get("thinking", "high"), "environment": profile.get("environment", {}), "checks": task["checks"], "wall_seconds": task.get("wall_seconds", 600)}
@@ -540,7 +971,7 @@ def run_task(task_file, profile_file, output, lock_root):
             info.size = len(data)
             info.mode = source["modes"].get(name.removeprefix("workspace/"), 0o600) if name.startswith("workspace/") else 0o600
             archive.addfile(info, io.BytesIO(data))
-    receipt = {"version": 1, "run_id": run_id, "task_id": task["task_id"], "kind": task["kind"], "started_at": utc_now(), "source": source, "input_sha256": digest(archive_path.read_bytes()), "remote_artifacts": remote + "/results", "cleanup_complete": False, "outcome": "incomplete"}
+    receipt = {"version": 2, "run_id": run_id, "task_id": task["task_id"], "kind": task["kind"], "started_at": utc_now(), "source": source, "input_sha256": digest(archive_path.read_bytes()), "remote_artifacts": remote + "/results", "cleanup_complete": False, "outcome": "incomplete"}
     write_new_json(output / "started.json", receipt)
     with exclusive_owner(profile, lock_root) as journal:
         if journal.exists() and not read_json(journal).get("cleanup_complete"):
@@ -593,6 +1024,7 @@ with tarfile.open(p) as archive:
                 cleanup_owner(owner, profile, receipt, protected)
                 receipt["ended_at"] = utc_now()
                 receipt["delivery_valid"] = receipt["cleanup_complete"] and receipt.get("protected_unchanged", False) and receipt.get("artifacts_verified", False) and receipt.get("exec_exit_code") == 0 and receipt["outcome"] == "returned"
+                receipt["capabilities_valid"] = receipt["cleanup_complete"] and receipt.get("protected_unchanged", False) and receipt.get("artifacts_verified", False) and receipt.get("exec_exit_code") == 0 and receipt["outcome"] == "capabilities"
                 receipt["acceptance"] = "not_granted"
                 save_journal()
                 write_new_json(output / "receipt.json", receipt)
@@ -630,9 +1062,18 @@ def recovery_inputs(failed_directory, profile):
     if not isinstance(task, dict) or not isinstance(launch, dict):
         raise ValueError("Invalid retained task/launch")
     expected_keys = {"version", "run_id", "task_id", "kind", "instructions", "workspace", "output_directory", "writable_paths", "allowed_tools", "max_tool_calls", "max_turns", "source", "checks"}
+    if task.get("version") == 2:
+        expected_keys |= {"operation", "run_options", "runtime_defaults"}
+        if task.get("operation") != "run":
+            raise ValueError("Only task execution evidence is recoverable")
     if set(task) != expected_keys:
         raise ValueError("Unexpected retained native task fields")
-    validate_task({key: task[key] for key in ("version", "task_id", "kind", "instructions", "writable_paths", "checks", "max_tool_calls", "max_turns")})
+    public_task = {key: task[key] for key in ("version", "task_id", "kind", "instructions", "writable_paths", "checks", "max_tool_calls", "max_turns")}
+    if task["version"] == 2:
+        public_task["run_options"] = task["run_options"]
+        if task["runtime_defaults"] != {"model": launch.get("model"), "thinking": launch.get("thinking")}:
+            raise ValueError("Retained runtime defaults differ from launch")
+    validate_task(public_task)
     remote = str(PurePosixPath(profile.get("remote_parent", "/sandbox/codex-pi")) / run_id)
     if task["run_id"] != run_id or task["task_id"] != original["task_id"] or task["kind"] != original["kind"] or task["source"] != original["source"] or task["workspace"] != remote + "/workspace" or task["output_directory"] != remote + "/results" or original["remote_artifacts"] != task["output_directory"]:
         raise ValueError("Retained task/source/remote identity mismatch")
@@ -659,6 +1100,8 @@ def verify_recovered_artifacts(results, task, source_files):
         raise ValueError("Expected a regular recovered results directory")
     actual = snapshot(results)
     allowed = {"worker-receipt.json", "model-report.json", "pi-events.jsonl", "extension-events.jsonl", "changes.json", "changes.patch"}
+    if task["version"] == 2:
+        allowed |= {"rpc-events.jsonl", "pi-stderr.log", "rpc-configuration.json"}
     allowed.update(check["name"] + suffix for check in task["checks"] for suffix in (".started.json", ".result.json", ".log"))
     if any(name not in allowed and not name.startswith("changed-files/") for name in actual):
         raise ValueError("Unexpected recovered artifact")
@@ -667,8 +1110,22 @@ def verify_recovered_artifacts(results, task, source_files):
         raise ValueError("Invalid recovered worker receipt")
     if "worker-receipt.json" in actual and (worker_receipt.get("run_id") != task["run_id"] or worker_receipt.get("task_id") != task["task_id"] or worker_receipt.get("outcome") not in {"returned", "failed", "incomplete"}):
         raise ValueError("Recovered worker identity/outcome mismatch")
+    if "version" in worker_receipt and worker_receipt["version"] != task["version"]:
+        raise ValueError("Recovered worker version differs from task")
     if "acceptance" in worker_receipt and worker_receipt["acceptance"] != "not_granted":
         raise ValueError("Recovered worker claims unauthorized acceptance")
+    if task["version"] == 2:
+        for name in ("rpc-events.jsonl", "pi-stderr.log"):
+            if len(actual.get(name, b"")) > MAX_OUTPUT_BYTES:
+                raise ValueError("Recovered RPC output exceeds limit")
+        if "rpc-configuration.json" in actual:
+            configuration = verify_rpc_configuration(results, task)
+            if "configuration" in worker_receipt and worker_receipt["configuration"] != configuration:
+                raise ValueError("Recovered RPC configuration differs from worker")
+        elif "configuration" in worker_receipt:
+            raise ValueError("Recovered worker configuration lacks its artifact")
+        if {"events", "extension", "model_report_sha256", "checks_passed"} & worker_receipt.keys() and "configuration" not in worker_receipt:
+            raise ValueError("Recovered post-Pi records lack RPC admission evidence")
     manifest = {name: digest(data) for name, data in actual.items() if name != "worker-receipt.json"}
     if "artifact_sha256" in worker_receipt and worker_receipt["artifact_sha256"] != manifest:
         raise ValueError("Recovered artifact manifest differs from actual bytes")
@@ -712,6 +1169,8 @@ def verify_recovered_artifacts(results, task, source_files):
     if "extension" in worker_receipt:
         if events is None or "extension-events.jsonl" not in actual or worker_receipt["extension"] != inspect_extension_events(results / "extension-events.jsonl", task, events, task_hash):
             raise ValueError("Recovered extension binding mismatch")
+        if task["version"] == 2 and worker_receipt["extension"].get("configuration") != worker_receipt.get("configuration", {}).get("effective"):
+            raise ValueError("Recovered extension/RPC configuration differs")
     # An interrupted final JSONL write may be incomplete. Every complete extension
     # record that is present must still bind the retained task, even without a receipt.
     if "extension-events.jsonl" in actual:
@@ -778,6 +1237,8 @@ def verify_recovered_artifacts(results, task, source_files):
         raise ValueError("Recovered change bytes lack their source manifest")
     complete = all(key in worker_receipt for key in ("artifact_sha256", "events", "extension", "model_report_sha256", "pi_exit_code", "checks", "checks_passed", "model_status", "acceptance", "ended_at")) and has_changes and len(completed_results) == len(task["checks"])
     if complete:
+        if task["version"] == 2 and "configuration" not in worker_receipt:
+            raise ValueError("Recovered terminal RPC configuration is missing")
         expected_outcome = "returned" if report.get("status") == "completed" and worker_receipt["checks_passed"] is not False and worker_receipt.get("model_report_matches_changes") is True else "failed"
         if worker_receipt["outcome"] != expected_outcome or worker_receipt["pi_exit_code"] != 0:
             raise ValueError("Recovered worker outcome contradicts terminal evidence")
@@ -853,6 +1314,12 @@ def main(argv=None):
     run.add_argument("--profile", type=Path, default=Path.home() / ".config/codex-pi-coordination/profile.json")
     run.add_argument("--output", type=Path, required=True)
     run.add_argument("--lock-root", type=Path, default=Path.home() / ".local/state/codex-pi-coordination")
+    configure = sub.add_parser("configure", help="Register an existing private profile as the default, without replacing one")
+    configure.add_argument("--profile", type=Path, required=True)
+    capabilities = sub.add_parser("capabilities", help="Inspect sanitized model capabilities without sending a prompt")
+    capabilities.add_argument("--profile", type=Path, default=Path.home() / ".config/codex-pi-coordination/profile.json")
+    capabilities.add_argument("--output", type=Path, required=True)
+    capabilities.add_argument("--lock-root", type=Path, default=Path.home() / ".local/state/codex-pi-coordination")
     recover = sub.add_parser("recover", help="Download evidence from the latest stopped failed run without rerunning it")
     recover.add_argument("failed_directory", type=Path)
     recover.add_argument("--profile", type=Path, default=Path.home() / ".config/codex-pi-coordination/profile.json")
@@ -865,6 +1332,13 @@ def main(argv=None):
     reconcile.add_argument("--lock-root", type=Path, default=Path.home() / ".local/state/codex-pi-coordination")
     args = parser.parse_args(argv)
     try:
+        if args.operation == "configure":
+            print(json.dumps(configure_profile(args.profile)))
+            return 0
+        if args.operation == "capabilities":
+            receipt = run_task(None, args.profile, args.output, args.lock_root, capabilities_only=True)
+            print(json.dumps({"run_id": receipt["run_id"], "capabilities_valid": receipt["capabilities_valid"], "delivery_valid": False, "acceptance": "not_granted", "receipt": str(args.output / "receipt.json")}))
+            return 0 if receipt["capabilities_valid"] else 1
         if args.operation == "worker":
             return worker(args.root)
         if args.operation == "reconcile":

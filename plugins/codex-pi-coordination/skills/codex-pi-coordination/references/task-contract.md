@@ -1,16 +1,17 @@
 # Task and runtime contracts
 
 Host: Python 3.10+ on POSIX and the installed OpenShell CLI. Sandbox: Python
-3.10+, Pi with the supported extension API, Node 22+ for a JavaScript Pi launch,
-and task dependencies. The runner installs nothing and has no third-party Python
-dependencies; the extension has no npm dependencies.
+3.10+, Pi with the supported extension and native RPC APIs, Node 22+ for a
+JavaScript Pi launch, and task dependencies. Missing required RPC capabilities
+fail explicitly. The runner installs nothing and has no third-party Python
+dependencies; the extension has no npm dependencies. Examples below are synthetic.
 
 ## Task
 
 ```json
 {
-  "version": 1,
-  "task_id": "repair-parser",
+  "version": 2,
+  "task_id": "parser:T001",
   "kind": "implementation",
   "instructions": "Fix empty-input handling. Change only parser.py and return an honest handoff. Verification runs after your return.",
   "repository": "/workspace/project",
@@ -19,7 +20,8 @@ dependencies; the extension has no npm dependencies.
   "checks": [{"name": "parser-check", "argv": ["python3", "check_parser.py"], "timeout_seconds": 30}],
   "max_tool_calls": 40,
   "max_turns": 32,
-  "wall_seconds": 600
+  "wall_seconds": 600,
+  "run_options": {"thinking": "low"}
 }
 ```
 
@@ -30,6 +32,28 @@ directories. Research may return `findings.md`; read-only review/validation may
 use no writable files and report findings through the handoff tool. Commands
 are coordinator-authored argv, executed once after Pi exits; they share the
 overall deadline and retain actual logs and exit status.
+
+Version 2 adds only optional `run_options` to the user task fields. It accepts
+`provider`, `model` and `thinking`; provider/model must appear together and
+thinking is independent. For example:
+
+```json
+{"provider": "configured-provider", "model": "exact-model-id", "thinking": "low"}
+```
+
+Omitted fields inherit the private profile. Reject unknown fields, empty strings,
+`auto`, `dynamic` and the literal `default`; a UI Default choice must omit the
+field. IDs are bounded identifiers, never argv, endpoints or environment input.
+Resolve the profile's qualified model selector against exact available
+provider/model identities. Zero or ambiguous matches refuse; no fuzzy matching,
+fallback or provider provisioning occurs. Named `max` is permitted only when the
+selected runtime/model advertises it.
+
+Version-2 task IDs match `[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}`. Version-1 user
+inputs keep their original fields and 80-character ID pattern
+`[A-Za-z0-9][A-Za-z0-9_.-]{0,79}`; they cannot contain `run_options`. New runs
+normalize either input version into the current native contract. Historical
+version-1 return/recovery artifacts keep their original interpretation.
 
 Bounds: source/returned workspace 64 MiB and 10,000 regular files, 128 writable
 paths, 32 checks, 4 MiB per log, 1 MiB task manifest, at most 500 tool calls,
@@ -57,9 +81,21 @@ Keep profiles outside public repositories. They reference configured provider
 storage, never credential values. Optional `openshell_argv` selects the CLI and
 owner-configured gateway/workspace arguments; default `["openshell"]`.
 Environment keys are restricted to runtime paths and the bytecode setting.
-Extension events record the model identity exposed by Pi. An alias's actual
-backend requires the provider owner's diagnostics; physical weights are not
-attested by this plugin.
+An omitted profile `thinking` retains the legacy `high` default; runtime support
+must still be checked before prompting. An alias's actual backend requires the
+provider owner's diagnostics; physical weights are not attested by this plugin.
+
+From the skill directory, register an existing private profile once:
+
+```sh
+python3 ../../scripts/coordinate.py configure --profile /path/to/private/profile.json
+```
+
+This validates and registers `~/.config/codex-pi-coordination/profile.json` using
+exclusive private creation. Semantically identical JSON is a no-op; symlinks and
+conflicting defaults refuse. There is no force/overwrite mode. Registration
+copies no credentials, edits no provider storage and proves no runtime behavior.
+Normal commands use this default; `--profile` selects another existing profile.
 
 All cooperating callers must share the local per-sandbox lock root. A persistent
 custody journal blocks reuse after uncertain outcomes. Name-based OpenShell
@@ -77,6 +113,47 @@ Do not collect remote artifacts while failed work may still be active. The
 runtime owner handles retention. Remote runs remain for diagnosis;
 preparation refuses when retained run data reaches 1 GiB.
 
+## Native RPC execution and capabilities
+
+Every new run starts an ephemeral `--no-session` native RPC child in the owned
+OpenShell worker, with only the explicit coordination extension and scoped tools.
+Saved-session continuation is future work (P1b); fresh runs do not resume an
+interactive process or official conversation file.
+
+Before the single task prompt, the runner queries available models, selects an
+exact provider/model, queries `get_available_thinking_levels`, validates and
+sets the requested/inherited thinking level, then reads `get_state`. Effective
+provider, model and thinking must match exactly; the child must be idle,
+noncompacting and have an empty pending queue. Unsupported options, clamping or
+missing RPC capabilities refuse with zero task prompts. No uncertain prompt
+acknowledgement is retried.
+
+The reader continuously consumes strict LF-framed JSONL, correlates command IDs
+and enforces byte, line, wall, tool and turn bounds, including incomplete lines
+and backpressure. Malformed/oversized data, unexpected EOF and missing, duplicate
+or wrong response IDs fail. Stderr remains bounded and separate from protocol.
+Full model objects are not retained; control evidence allowlists identity, level
+and state fields before persistence.
+
+After one valid handoff, require `agent_settled` and an idle/empty-queue readback.
+The runner closes stdin for orderly shutdown and requires child exit and
+extension shutdown before executing checks. Prompt acknowledgement or
+`agent_end` alone is insufficient. Timeout/cancellation retains managed
+OpenShell stop; no arbitrary PID or process-group fallback is authorized.
+
+```sh
+python3 ../../scripts/coordinate.py capabilities --output /private/evidence/new-capabilities
+```
+
+`capabilities` accepts the normal `--profile` and `--lock-root` options. It uses
+the same owned disposable lifecycle with zero prompts, tools or extensions and
+returns only available provider/model IDs, the configured model's supported
+thinking levels and sanitized runtime identity. Any necessary model selection
+is confined to the ephemeral child; no global setting persists. Its CLI reports
+`capabilities_valid`; the receipt retains `delivery_valid: false` and
+`acceptance: not_granted`. Metadata discovery is separate from actual setup,
+model execution and real-edit qualification.
+
 ## Return and trust
 
 `started.json` binds the run and input archive. `receipt.json` records worker
@@ -84,6 +161,17 @@ outcome, cleanup and protected-resource readback. `results/worker-receipt.json`
 records actual Pi exit, event completion, changes and checks. Every check has
 exclusive started/result records and a log SHA256; interruption never fabricates
 a successful terminal receipt.
+
+New return evidence includes `rpc-events.jsonl` (sanitized control transcript),
+`pi-stderr.log` (separate diagnostic output) and `rpc-configuration.json`.
+The worker receipt's `configuration` binds requested options, profile defaults,
+effective options, supported levels, ephemeral session ID, prompt admission,
+settlement, shutdown and RPC/stderr hashes. Input/task/source hashes bind this
+evidence to the assignment. The version-2 extension's `run_configuration` event
+at the first `before_agent_start` records actual provider/model from its context
+and thinking from `pi.getThinkingLevel()`. `task_loaded.model` records startup
+state and does not prove the later RPC selection. Normal verification and
+recovery decode v1/v2 explicitly; old evidence cannot acquire these new claims.
 
 `model-report.json` is Pi's task-bound self-report. `extension-events.jsonl`
 records task loading, budget/tool observations and lifecycle events. These are
@@ -95,6 +183,7 @@ cannot tamper with same-user files. Stronger claims need independent validation.
 `changes.patch` is a convenience text diff. Binary and empty-file changes require
 the manifest/bytes. Do not automatically apply patches to a newer checkout.
 Verification may create outputs but must not alter returned source/artifacts.
+The byte-change receipt does not attest mode-only edits.
 
 For lower-level Pi loading, use `--extension <plugin>/extensions/coordination.js
 --coordination-task <task.json>`. That manifest additionally includes run_id,
@@ -104,10 +193,10 @@ extension loading supplies neither OS isolation nor managed cleanup.
 
 Pi's CLI `--tools` allowlist must include `coordination_status` and
 `coordination_handoff` alongside the task's native tools. The extension checks
-activation, records missing-tool refusal and blocks further tools. Pi 0.87.1
-print/JSON mode does not wire a shutdown callback for `ctx.shutdown()`, so this
-refusal does not guarantee zero model requests. The runner's wall deadline and
-managed OpenShell stop remain the process boundary.
+activation, records missing-tool refusal and blocks further tools. Standalone
+extension refusal does not establish the runner's pre-prompt configuration or
+managed-stop guarantees. The runner's wall deadline and managed OpenShell stop
+remain the process boundary.
 
 ## Failed-run recovery
 

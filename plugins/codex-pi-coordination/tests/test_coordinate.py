@@ -50,6 +50,8 @@ task_digest=hashlib.sha256(task_path.read_bytes()).hexdigest()
 def extension_event(kind, calls=1, turns=1, handed_off=True, **fields):
     return {'type':kind,'at':'2000-01-01T00:00:00Z','active':True,'run_id':task['run_id'],'task_id':task['task_id'],'task_sha256':task_digest,'tool_calls':calls,'turns':turns,'handed_off':handed_off,**fields}
 extension_events=[extension_event('task_loaded',0,0,False),extension_event('tool_call',handed_off=False,tool_name='coordination_handoff',tool_call_id='call-1'),extension_event('handoff',reported_status=report['status']),extension_event('agent_settled'),extension_event('session_shutdown')]
+if task['version']==2:
+    extension_events.insert(1,extension_event('run_configuration',0,0,False,configuration=rpc_effective))
 if behavior=='extension-refused': extension_events.insert(3,extension_event('refused',failure={'code':'task_unavailable','message':'No further tools'},code='task_unavailable'))
 if behavior=='extension-failure': extension_events[-1]['failure']={'code':'tool_budget_exhausted','message':'Budget exhausted'}
 if behavior=='extension-wrong-run': extension_events[1]['run_id']='different-run'
@@ -69,6 +71,58 @@ if behavior!='extension-missing':
         for event in extension_events: stream.write(json.dumps(event)+'\n')
 for event in events: print(json.dumps(event),flush=True)
 raise SystemExit(7 if behavior=='exit-seven' else 0)
+'''
+
+FAKE_RPC = 'PRINT_FIXTURE = ' + repr(FAKE_PI) + '\n' + r'''
+import json, pathlib, sys, os
+behavior = sys.argv[1]
+requests_file = pathlib.Path(__file__).with_suffix('.requests.jsonl')
+model = {'provider':'example','id':'model','headers':{'Authorization':'synthetic-private-marker'},'baseUrl':'https://synthetic.invalid/private'}
+thinking = 'high'
+levels = ['off','minimal','low','medium','high','xhigh','max']
+held = None
+def reply(request, data=None):
+    value={'type':'response','id':request['id'],'command':request['type'],'success':True,'data':data}
+    if behavior=='wrong-response': value['id']='foreign'
+    if behavior=='wrong-command': value['command']='foreign'
+    if behavior=='refused': value.update(success=False,error='synthetic-private-marker')
+    line=json.dumps(value)+'\r\n'
+    if behavior=='malformed': line='{bad}\n'
+    if behavior=='partial': sys.stdout.write('{"type":');sys.stdout.flush();raise SystemExit(0)
+    if behavior=='oversized': line='x'* (4*1024*1024+1)+'\n'
+    if behavior=='stderr-overflow': sys.stderr.write('x'*(4*1024*1024+1));sys.stderr.flush()
+    if behavior=='noisy': sys.stderr.write('synthetic diagnostic\n'*10000);sys.stderr.flush()
+    sys.stdout.write(line);sys.stdout.flush()
+    if behavior=='duplicate': sys.stdout.write(line);sys.stdout.flush()
+for line in sys.stdin:
+    request=json.loads(line)
+    with requests_file.open('a') as stream: stream.write(json.dumps(request)+'\n')
+    command=request['type']
+    if behavior=='no-response': continue
+    if command=='get_available_models':
+        data={'models':[model,{'provider':'second','id':'model-two','headers':{'secret':'synthetic-private-marker'}}]}
+        if behavior=='out-of-order': held=(request,data);continue
+    elif command=='get_state':
+        data={'model':model,'thinkingLevel':thinking,'sessionId':'session-one','sessionFile':None,'isStreaming':False,'isCompacting':False,'pendingMessageCount':0}
+        if behavior=='busy': data['pendingMessageCount']=1
+    elif command=='get_available_thinking_levels': data={'levels':['low'] if behavior=='only-low' else levels}
+    elif command=='set_model':
+        model={'provider':request['provider'],'id':request['modelId']};data=model
+    elif command=='set_thinking_level':
+        thinking='low' if behavior=='clamped' else request['level'];data=None
+    elif command=='prompt':
+        if behavior=='no-prompt-ack': continue
+        reply(request)
+        namespace={'rpc_effective':{'provider':model['provider'],'model':model['id'],'thinking':thinking}}
+        try: exec(PRINT_FIXTURE,namespace)
+        except SystemExit as result:
+            if result.code: raise
+        if behavior!='no-settlement': print(json.dumps({'type':'agent_settled'}),flush=True)
+        continue
+    else: raise AssertionError(command)
+    reply(request,data)
+    if held:
+        reply(*held);held=None
 '''
 
 FAKE_EXEC = r'''
@@ -103,6 +157,38 @@ def make_archive(entries):
 
 
 class ContractTests(unittest.TestCase):
+    def test_version_two_options_and_namespaced_ids_are_strict(self):
+        task = {**task_template(), "version": 2, "task_id": "project:T001", "run_options": {"thinking": "max"}}
+        self.assertEqual(coordinate.validate_task(task), task)
+        for options in [{"model": "unpaired"}, {"provider": "unpaired"}, {"thinking": "auto"}, {"thinking": "dynamic"}, {"thinking": "default"}, {"thinking": []}, {"extra": "value"}, {"provider": "https://example.invalid", "model": "id"}]:
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                coordinate.validate_task({**task, "run_options": options})
+        with self.assertRaises(ValueError):
+            coordinate.validate_task({**task, "version": 1})
+
+    def test_default_registration_is_private_idempotent_and_refuses_conflicts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.json"
+            profile = {"sandbox_name": "fixture", "sandbox_id": "exact-id", "pi_argv": ["pi"], "model": "example/model"}
+            dump(source, profile)
+            destination = root / "settings/profile.json"
+            first = coordinate.configure_profile(source, destination)
+            self.assertTrue(first["changed"])
+            self.assertFalse(first["runtime_verified"])
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(destination.parent.stat().st_mode & 0o777, 0o700)
+            original = destination.read_bytes()
+            dump(source, dict(reversed(list(profile.items()))))
+            self.assertFalse(coordinate.configure_profile(source, destination)["changed"])
+            self.assertEqual(destination.read_bytes(), original)
+            dump(source, {**profile, "thinking": "low"})
+            with self.assertRaises(ValueError): coordinate.configure_profile(source, destination)
+            link = root / "linked"; link.symlink_to(destination.parent, target_is_directory=True)
+            with self.assertRaises(ValueError): coordinate.configure_profile(source, link / "profile.json")
+            destination.unlink(); destination.symlink_to(source)
+            with self.assertRaises(ValueError): coordinate.configure_profile(source, destination)
+
     def test_malformed_tasks_fail_as_validation_errors(self):
         bad_fields = [("version", True), ("kind", []), ("task_id", "../escape"),
                       ("instructions", ""), ("writable_paths", ["."]),
@@ -443,9 +529,154 @@ for(const event of [{type:'tool_execution_start',toolCallId:'handoff-1',toolName
             coordinate.verify_return(pristine, task, source, "unrelated-run")
 
 
+class RpcTests(unittest.TestCase):
+    setUp = WorkerTests.setUp
+
+    def prepare(self, name="rpc", behavior="change", options=None, metadata=False):
+        root = WorkerTests.prepare(self, name=name, behavior=behavior)
+        (root / "fake-pi.py").write_text(FAKE_RPC)
+        task = coordinate.read_json(root / "task.json")
+        task.update(version=2, task_id="project:T001", operation="capabilities" if metadata else "run", run_options=options or {}, runtime_defaults={"model": "example/model", "thinking": "high"})
+        if metadata:
+            task.update(writable_paths=[], checks=[])
+        dump(root / "task.json", task)
+        launch = coordinate.read_json(root / "launch.json"); launch["wall_seconds"] = 1
+        dump(root / "launch.json", launch)
+        return root
+
+    def requests(self, root):
+        path = root / "fake-pi.requests.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def test_default_and_exact_overrides_return_real_changes_with_private_metadata_removed(self):
+        for index, options in enumerate([{}, {"thinking": "low"}, {"provider": "second", "model": "model-two", "thinking": "max"}]):
+            with self.subTest(options=options):
+                root = self.prepare(name=str(index), options=options)
+                launch_before = (root / "launch.json").read_bytes()
+                self.assertEqual(coordinate.worker(root), 0)
+                task = coordinate.read_json(root / "task.json")
+                receipt = coordinate.verify_return(root / "results", task, {"answer.txt": b"before\n"}, "run-one")
+                effective = receipt["configuration"]["effective"]
+                self.assertEqual(effective["thinking"], options.get("thinking", "high"))
+                self.assertEqual(effective["provider"], options.get("provider", "example"))
+                self.assertEqual((root / "results/changed-files/answer.txt").read_bytes(), b"after\n")
+                self.assertEqual((root / "launch.json").read_bytes(), launch_before)
+                self.assertEqual(sum(request["type"] == "prompt" for request in self.requests(root)), 1)
+                for contents in coordinate.snapshot(root / "results").values():
+                    self.assertNotIn(b"synthetic-private-marker", contents)
+                    self.assertNotIn(b"synthetic.invalid", contents)
+
+    def test_options_refuse_before_prompt_without_fallback(self):
+        cases = [("unchanged", {"provider": "absent", "model": "absent"}), ("only-low", {}), ("clamped", {"thinking": "max"}), ("busy", {})]
+        for index, (behavior, options) in enumerate(cases):
+            with self.subTest(behavior=behavior):
+                root = self.prepare(name=str(index), behavior=behavior, options=options)
+                self.assertEqual(coordinate.worker(root), 1)
+                self.assertFalse(any(request["type"] == "prompt" for request in self.requests(root)))
+                self.assertFalse((root / "results/model-report.json").exists())
+
+    def test_correlated_metadata_accepts_out_of_order_responses(self):
+        root = self.prepare(behavior="out-of-order")
+        self.assertEqual(coordinate.worker(root), 0)
+        coordinate.verify_return(root / "results", coordinate.read_json(root / "task.json"), {"answer.txt": b"before\n"}, "run-one")
+
+    def test_stderr_backpressure_is_drained_without_becoming_protocol(self):
+        root = self.prepare(behavior="noisy")
+        self.assertEqual(coordinate.worker(root), 0)
+        self.assertGreater((root / "results/pi-stderr.log").stat().st_size, 65536)
+        self.assertNotIn(b"synthetic diagnostic", (root / "results/rpc-events.jsonl").read_bytes())
+        coordinate.verify_return(root / "results", coordinate.read_json(root / "task.json"), {"answer.txt": b"before\n"}, "run-one")
+
+    def test_interruption_closes_exact_child_stdin_without_fabricating_completion(self):
+        root = self.prepare(behavior="no-response")
+        children = []
+        real_init = coordinate.PiRpc.__init__
+        def track_child(instance, *args, **kwargs):
+            real_init(instance, *args, **kwargs)
+            children.append(instance.process)
+        with mock.patch.object(coordinate.PiRpc, "__init__", track_child), mock.patch.object(coordinate.PiRpc, "pump", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt): coordinate.worker(root)
+        self.assertEqual(len(children), 1)
+        self.assertEqual(children[0].wait(timeout=2), 0)
+        self.assertFalse((root / "results/rpc-configuration.json").exists())
+        self.assertEqual(coordinate.read_json(root / "results/worker-receipt.json")["outcome"], "incomplete")
+
+    def test_bad_protocol_and_bounds_never_prompt_or_return_success(self):
+        for behavior in ["wrong-response", "wrong-command", "duplicate", "refused", "malformed", "partial", "oversized", "stderr-overflow", "no-response"]:
+            with self.subTest(behavior=behavior):
+                root = self.prepare(name=behavior, behavior=behavior)
+                self.assertEqual(coordinate.worker(root), 1)
+                self.assertFalse(any(request["type"] == "prompt" for request in self.requests(root)))
+                self.assertFalse((root / "results/rpc-configuration.json").exists())
+
+    def test_missing_ack_or_settlement_is_not_retried_and_checks_do_not_run(self):
+        for behavior in ["no-prompt-ack", "no-settlement"]:
+            root = self.prepare(name=behavior, behavior=behavior)
+            self.assertEqual(coordinate.worker(root), 1)
+            self.assertEqual(sum(request["type"] == "prompt" for request in self.requests(root)), 1)
+            self.assertFalse((root / "results/changes.json").exists())
+
+    def test_metadata_only_has_no_prompt_extension_or_change_artifacts(self):
+        root = self.prepare(metadata=True)
+        self.assertEqual(coordinate.worker(root), 0)
+        task = coordinate.read_json(root / "task.json")
+        receipt = coordinate.verify_return(root / "results", task, {"answer.txt": b"before\n"}, "run-one")
+        self.assertEqual(receipt["outcome"], "capabilities")
+        self.assertFalse(receipt["configuration"]["prompt_sent"])
+        self.assertFalse(any(request["type"] in {"prompt", "set_model", "set_thinking_level"} for request in self.requests(root)))
+
+    def test_trusted_check_observes_changed_bytes_after_shutdown(self):
+        root = self.prepare()
+        task = coordinate.read_json(root / "task.json")
+        check = {"name": "after-shutdown", "argv": [sys.executable, "-c", "import json,pathlib; p=pathlib.Path; assert p('answer.txt').read_text()=='after\\n'; assert json.loads(p('../results/extension-events.jsonl').read_text().splitlines()[-1])['type']=='session_shutdown'; print('checked returned bytes after shutdown')"], "timeout_seconds": 2}
+        task["checks"] = [check]; dump(root / "task.json", task)
+        launch = coordinate.read_json(root / "launch.json"); launch["checks"] = [check]; dump(root / "launch.json", launch)
+        self.assertEqual(coordinate.worker(root), 0)
+        receipt = coordinate.verify_return(root / "results", task, {"answer.txt": b"before\n"}, "run-one")
+        self.assertTrue(receipt["checks_passed"])
+        self.assertIn(b"checked returned bytes", (root / "results/after-shutdown.log").read_bytes())
+
+    def test_resealed_configuration_contradictions_are_rejected(self):
+        root = self.prepare()
+        self.assertEqual(coordinate.worker(root), 0)
+        configuration = coordinate.read_json(root / "results/rpc-configuration.json")
+        configuration["effective"]["thinking"] = "low"
+        dump(root / "results/rpc-configuration.json", configuration)
+        worker = coordinate.read_json(root / "results/worker-receipt.json")
+        worker["configuration"] = configuration
+        worker["artifact_sha256"] = {name: coordinate.digest(raw) for name, raw in coordinate.snapshot(root / "results").items() if name != "worker-receipt.json"}
+        dump(root / "results/worker-receipt.json", worker)
+        task = coordinate.read_json(root / "task.json")
+        with self.assertRaises(ValueError): coordinate.verify_return(root / "results", task, {"answer.txt": b"before\n"}, "run-one")
+        with self.assertRaises(ValueError): coordinate.verify_recovered_artifacts(root / "results", task, {"answer.txt": b"before\n"})
+
+
 class RecoveryChangeTests(unittest.TestCase):
     setUp = WorkerTests.setUp
     prepare = WorkerTests.prepare
+
+    def test_historical_v1_inputs_and_failed_artifacts_remain_recoverable(self):
+        root = self.prepare(name="a" * 32, checks=[{"name": "failed", "argv": [sys.executable, "-c", "raise SystemExit(9)"], "timeout_seconds": 2}])
+        task = coordinate.read_json(root / "task.json")
+        task["run_id"] = root.name
+        task["source"]["modes"] = {"answer.txt": 0o644}
+        task["allowed_tools"] = sorted(coordinate.TOOLS)
+        dump(root / "task.json", task)
+        self.assertEqual(coordinate.worker(root), 1)
+        payload = {"task.json": json.dumps(task).encode(), "launch.json": (root / "launch.json").read_bytes(), "coordinate.py": b"# retained version one worker", "extension.js": b"// retained version one extension", "package.json": b'{"type":"module"}', "workspace/answer.txt": b"before\n"}
+        archive = make_archive([(name, raw, tarfile.REGTYPE) for name, raw in payload.items()])
+        (root / "inputs.tar").write_bytes(archive)
+        original = {"version": 1, "run_id": root.name, "task_id": task["task_id"], "kind": task["kind"], "started_at": "2000-01-01T00:00:00Z", "source": task["source"], "input_sha256": coordinate.digest(archive), "remote_artifacts": str(root / "results"), "delivery_valid": False}
+        dump(root / "started.json", original); dump(root / "receipt.json", original)
+        profile = {"remote_parent": str(self.root)}
+        before = {name: (root / name).read_bytes() for name in ["started.json", "receipt.json", "inputs.tar"]}
+        _original, retained_task, source, _hashes = coordinate.recovery_inputs(root, profile)
+        self.assertEqual(retained_task, task)
+        recovered = coordinate.verify_recovered_artifacts(root / "results", retained_task, source)
+        self.assertEqual(recovered["evidence_status"], "complete")
+        self.assertEqual(recovered["worker_outcome"], "failed")
+        self.assertEqual(recovered["checks"][0]["exit_code"], 9)
+        self.assertEqual(before, {name: (root / name).read_bytes() for name in before})
 
     def test_failed_check_change_bindings_remain_strict(self):
         check = {'name': 'proof', 'argv': [sys.executable, '-c', 'raise SystemExit(9)'], 'timeout_seconds': 2}
@@ -476,7 +707,7 @@ class OwnerTests(unittest.TestCase):
                         "pi_argv": [sys.executable, str(self.root / "fake-pi.py"), "unchanged"],
                         "model": "example/model", "remote_parent": str(self.root / "remote"),
                         "python": sys.executable, "protected_sandboxes": ["protected"]}
-        (self.root / "fake-pi.py").write_text(FAKE_PI)
+        (self.root / "fake-pi.py").write_text(FAKE_RPC)
         (self.root / "fake-exec.py").write_text(FAKE_EXEC)
         self.profile["openshell_argv"] = [sys.executable, str(self.root / "fake-exec.py")]
         self.profile_path = self.root / "profile.json"; dump(self.profile_path, self.profile)
@@ -537,6 +768,20 @@ class OwnerTests(unittest.TestCase):
         self.assertEqual(receipt["acceptance"], "not_granted")
         self.assertEqual(self.instances[0].calls.count("start"), 1)
         self.assertEqual(self.instances[0].calls.count("stop"), 1)
+
+    def test_registered_default_supports_capabilities_and_run_without_profile_flag(self):
+        with mock.patch.object(Path, "home", return_value=self.root), mock.patch.object(coordinate, "OpenShellOwner", self.factory()), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(coordinate.main(["configure", "--profile", str(self.profile_path)]), 0)
+            default = self.root / ".config/codex-pi-coordination/profile.json"
+            original = default.read_bytes()
+            self.assertEqual(coordinate.main(["capabilities", "--output", str(self.root / "metadata")]), 0)
+            metadata = coordinate.read_json(self.root / "metadata/receipt.json")
+            self.assertTrue(metadata["capabilities_valid"])
+            self.assertFalse(metadata["delivery_valid"])
+            self.assertTrue(metadata["cleanup_complete"])
+            self.assertEqual(coordinate.main(["run", str(self.task_path), "--output", str(self.root / "default-run")]), 0)
+            self.assertTrue(coordinate.read_json(self.root / "default-run/receipt.json")["delivery_valid"])
+            self.assertEqual(default.read_bytes(), original)
 
     def test_identity_or_ready_refusal_has_no_lifecycle_side_effect(self):
         for mode in ["initial-wrong-id", "initial-ready"]:

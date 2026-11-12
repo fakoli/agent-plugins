@@ -32,6 +32,7 @@ function runtime(taskPath, cwd, allowedTools) {
     registerCommand: (name, command) => commands.set(name, command),
     on: (name, handler) => handlers.set(name, handler),
     getActiveTools: () => active,
+    getThinkingLevel: () => ctx.thinking ?? "high",
     setActiveTools: (names) => { active = allowedTools ? names.filter((name) => allowedTools.includes(name)) : names; },
   };
   extension(pi);
@@ -50,6 +51,37 @@ function runtime(taskPath, cwd, allowedTools) {
 
 const handoff = (changed_files = []) => ({ status: "completed", summary: "Inspected the provided fixture.", evidence: ["input.txt"], changed_files, limitations: ["Model self-report; external checks remain required."] });
 const events = (f) => fs.readFileSync(path.join(f.output, "extension-events.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
+
+test("v2 binds namespaced scope and actual options before model work", async (t) => {
+  const f = fixture(t, { version: 2, task_id: "project:T001", operation: "run", run_options: { thinking: "low" }, runtime_defaults: { model: "fixture-provider/fixture-model", thinking: "high" } });
+  const r = runtime(f.taskPath, f.workspace);
+  r.ctx.thinking = "low";
+  await r.emit("session_start");
+  await r.emit("before_agent_start", { systemPrompt: "original" });
+  await r.emit("before_agent_start", { systemPrompt: "original" });
+  assert.deepEqual(events(f).map((event) => event.type), ["task_loaded", "run_configuration"]);
+  assert.deepEqual(events(f)[1].configuration, { provider: "fixture-provider", model: "fixture-model", thinking: "low" });
+  await r.emit("session_shutdown");
+});
+
+test("v2 rejects malformed options and mismatched effective model or thinking", async (t) => {
+  const base = { version: 2, operation: "run", run_options: {}, runtime_defaults: { model: "fixture-provider/fixture-model", thinking: "high" } };
+  for (const run_options of [{ model: "unpaired" }, { provider: "unpaired" }, { thinking: "auto" }, { thinking: "dynamic" }, { thinking: "default" }, { extra: "value" }]) {
+    const f = fixture(t, { ...base, run_options });
+    assert.throws(() => loadTask(f.taskPath, f.workspace), /run options/);
+  }
+  for (const changes of [{ model: { provider: "foreign", id: "model" } }, { thinking: "low" }]) {
+    const f = fixture(t, base);
+    const r = runtime(f.taskPath, f.workspace);
+    Object.assign(r.ctx, changes);
+    await r.emit("session_start");
+    assert.equal(await r.emit("before_agent_start", { systemPrompt: "original" }), undefined);
+    assert.equal(r.ctx.aborted, 1);
+    assert.equal(events(f).at(-1).code, "configuration_mismatch");
+    assert.equal(fs.existsSync(path.join(f.output, "model-report.json")), false);
+    await r.emit("session_shutdown");
+  }
+});
 
 test("each task kind injects context and returns a bound self-report without acceptance", async (t) => {
   for (const kind of ["implementation", "research", "review", "validation"]) {
