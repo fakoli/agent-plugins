@@ -543,7 +543,30 @@ for(const event of [{type:'tool_execution_start',toolCallId:'handoff-1',toolName
 
 
 class RpcTests(unittest.TestCase):
-    setUp = WorkerTests.setUp
+    def setUp(self):
+        WorkerTests.setUp(self)
+        self.fake_pi_processes = []
+        real_initialize = coordinate.PiRpc.__init__
+
+        def retain_fake_pi_process(instance, *args, **kwargs):
+            real_initialize(instance, *args, **kwargs)
+            self.fake_pi_processes.append(instance.process)
+
+        patcher = mock.patch.object(coordinate.PiRpc, "__init__", retain_fake_pi_process)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.join_fake_pi_processes)
+
+    def join_fake_pi_processes(self):
+        # The worker closes its streams; the fixture owns the local children
+        # that stand in for the managed remote runtime's cleanup responsibility.
+        running_processes = []
+        for process in self.fake_pi_processes:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                running_processes.append(process.pid)
+        self.assertEqual(running_processes, [], "Fake Pi children did not exit after worker cleanup")
 
     def prepare(self, name="rpc", behavior="change", options=None, metadata=False):
         root = WorkerTests.prepare(self, name=name, behavior=behavior)
