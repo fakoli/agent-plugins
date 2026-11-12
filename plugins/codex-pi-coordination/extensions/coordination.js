@@ -72,8 +72,13 @@ export function loadTask(taskPath, cwd) {
     fail("invalid_task", "Expected a supported versioned coordination task and kind");
   }
   for (const key of ["run_id", "task_id"]) {
-    if (!/^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}$/.test(boundedString(task[key], key, 128))) fail("invalid_task", `Invalid ${key}`);
+    const pattern = key === "task_id" && task.version === 1
+      ? /^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$/
+      : /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
+    const value = boundedString(task[key], key, 128);
+    if (pattern.exec(value)?.[0] !== value) fail("invalid_task", `Invalid ${key}`);
   }
+  if (task.version === 1 && "run_options" in task) fail("invalid_task", "Version 1 cannot contain run_options");
   if (task.version === 2) {
     const options = task.run_options;
     const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];

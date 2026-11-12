@@ -170,7 +170,45 @@ def make_archive(entries):
     return output.getvalue()
 
 
+def native_extension_load_results(cases):
+    # Exercise the actual extension, without Pi, an owner or a model prompt.
+    program = """import fs from 'node:fs';
+const {loadTask} = await import(process.argv[1]);
+const cases = JSON.parse(fs.readFileSync(0, 'utf8'));
+console.log(JSON.stringify(cases.map(item => { try { loadTask(item.task, item.cwd); return true; } catch { return false; } })));
+"""
+    result = subprocess.run(["node", "--input-type=module", "-e", program, (SCRIPT.parent.parent / "extensions/coordination.js").as_uri()], input=json.dumps(cases), text=True, capture_output=True, timeout=10, check=True)
+    return json.loads(result.stdout)
+
+
 class ContractTests(unittest.TestCase):
+    def test_python_versioned_task_boundary_matches_actual_extension(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"; workspace.mkdir()
+            output = root / "results"; output.mkdir()
+            cases = []
+            for version, maximum in [(1, 80), (2, 128)]:
+                variants = [(identifier, {}, valid) for identifier, valid in [("task-one", True), ("t" * maximum, True), ("project:T001", version == 2), ("t" * (maximum + 1), False), ("task-one\n", False), ("task-one\r\n", False)]]
+                variants += [("task-one", {"run_options": options}, version == 2) for options in [{}, {"thinking": "low"}]]
+                for identifier, fields, expected in variants:
+                    public = {**task_template(), "version": version, "task_id": identifier, **fields}
+                    if expected:
+                        self.assertEqual(coordinate.validate_task(public), public)
+                    else:
+                        with self.assertRaises(ValueError): coordinate.validate_task(public)
+                    task_path = root / f"task-{len(cases)}.json"
+                    native = {**public, "run_id": "run-one", "workspace": str(workspace), "output_directory": str(output), "allowed_tools": ["read"], "max_tool_calls": 8}
+                    if version == 2:
+                        native.update(operation="run", run_options=public.get("run_options", {}), runtime_defaults={"model": "example/model", "thinking": "high"})
+                    dump(task_path, native)
+                    cases.append({"task": str(task_path), "cwd": str(workspace), "expected": expected})
+                # The public assignment never chooses a run ID; native artifacts do.
+                with self.assertRaises(ValueError):
+                    coordinate.validate_task({**task_template(), "version": version, "run_id": "run-one"})
+            self.assertEqual(native_extension_load_results(cases), [case["expected"] for case in cases])
+            self.assertEqual(list(output.iterdir()), [])
+
     def test_version_two_options_and_namespaced_ids_are_strict(self):
         task = {**task_template(), "version": 2, "task_id": "project:T001", "run_options": {"thinking": "max"}}
         self.assertEqual(coordinate.validate_task(task), task)
@@ -251,15 +289,7 @@ class ContractTests(unittest.TestCase):
                 task_path = root / f"task-{index}.json"
                 dump(task_path, {**task_template(), "version": 2, "run_id": "run-one", "operation": "run", "run_options": {}, "runtime_defaults": defaults, "workspace": str(workspace), "output_directory": str(output), "allowed_tools": ["read"], "max_tool_calls": 8})
                 cases.append({"task": str(task_path), "cwd": str(workspace), "expected": pair is not None})
-            # Use the actual native loader on Python-configured defaults, without
-            # Pi, an owner, a prompt or a duplicated JavaScript predicate.
-            program = """import fs from 'node:fs';
-const {loadTask} = await import(process.argv[1]);
-const cases = JSON.parse(fs.readFileSync(0, 'utf8'));
-console.log(JSON.stringify(cases.map(item => { try { loadTask(item.task, item.cwd); return true; } catch { return false; } })));
-"""
-            result = subprocess.run(["node", "--input-type=module", "-e", program, (SCRIPT.parent.parent / "extensions/coordination.js").as_uri()], input=json.dumps(cases), text=True, capture_output=True, timeout=10, check=True)
-            self.assertEqual(json.loads(result.stdout), [case["expected"] for case in cases])
+            self.assertEqual(native_extension_load_results(cases), [case["expected"] for case in cases])
             self.assertEqual(list(output.iterdir()), [])
             ambiguous = [{"provider": "one/two", "id": "three"}, {"provider": "one", "id": "two/three"}]
             selection = {"run_options": {}, "runtime_defaults": {"model": "one/two/three", "thinking": "high"}}

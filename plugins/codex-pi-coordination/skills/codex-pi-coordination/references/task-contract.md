@@ -55,6 +55,12 @@ inputs keep their original fields and 80-character ID pattern
 normalize either input version into the current native contract. Historical
 version-1 return/recovery artifacts keep their original interpretation.
 
+Public assignments never supply `run_id`. Native artifacts carry a separate
+coordinator-generated run identity; the extension preserves its historical
+128-character pattern `[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}` in both versions.
+The version-1 task-ID limit does not apply to that native field. Both ID fields
+must match their entire pattern, without trailing newlines.
+
 Bounds: source/returned workspace 64 MiB and 10,000 regular files, 128 writable
 paths, 32 checks, 4 MiB per log, 1 MiB task manifest, at most 500 tool calls,
 200 turns and 1,800 seconds of worker time. Source links/submodules and

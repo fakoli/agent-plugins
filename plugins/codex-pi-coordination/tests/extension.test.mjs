@@ -52,6 +52,34 @@ function runtime(taskPath, cwd, allowedTools) {
 const handoff = (changed_files = []) => ({ status: "completed", summary: "Inspected the provided fixture.", evidence: ["input.txt"], changed_files, limitations: ["Model self-report; external checks remain required."] });
 const events = (f) => fs.readFileSync(path.join(f.output, "extension-events.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
 
+test("versioned task IDs preserve legacy native run IDs and reject unsupported options", async (t) => {
+  for (const version of [1, 2]) {
+    const maximum = version === 1 ? 80 : 128;
+    const base = { version, ...(version === 2 ? { operation: "run", run_options: {}, runtime_defaults: { model: "fixture-provider/fixture-model", thinking: "high" } } : {}) };
+    const f = fixture(t, { ...base, task_id: "t".repeat(maximum), run_id: "run:" + "r".repeat(124) });
+    assert.equal(loadTask(f.taskPath, f.workspace).task.run_id.length, 128);
+    const r = runtime(f.taskPath, f.workspace);
+    await r.emit("session_start");
+    assert.ok((await r.emit("before_agent_start", { systemPrompt: "original" })).systemPrompt);
+    assert.equal(r.ctx.aborted, 0);
+    await r.emit("session_shutdown");
+    for (const [field, invalid] of [["task_id", "t".repeat(maximum + 1)], ["task_id", "task-one\n"], ["task_id", "task-one\r\n"], ["run_id", "r".repeat(129)], ["run_id", "run-one\n"], ["run_id", "run-one\r\n"]]) {
+      const invalidFixture = fixture(t, { ...base, [field]: invalid });
+      assert.throws(() => loadTask(invalidFixture.taskPath, invalidFixture.workspace), new RegExp(field));
+    }
+    const namespaced = fixture(t, { ...base, task_id: "project:T001" });
+    if (version === 1) {
+      assert.throws(() => loadTask(namespaced.taskPath, namespaced.workspace), /task_id/);
+      for (const run_options of [{}, { thinking: "low" }, null]) {
+        const invalidFixture = fixture(t, { ...base, run_options });
+        assert.throws(() => loadTask(invalidFixture.taskPath, invalidFixture.workspace), /run_options/);
+      }
+    } else {
+      assert.equal(loadTask(namespaced.taskPath, namespaced.workspace).task.task_id, "project:T001");
+    }
+  }
+});
+
 test("v2 binds namespaced scope and actual options before model work", async (t) => {
   const f = fixture(t, { version: 2, task_id: "project:T001", operation: "run", run_options: { thinking: "low" }, runtime_defaults: { model: "fixture-provider/fixture-model", thinking: "high" } });
   const r = runtime(f.taskPath, f.workspace);
