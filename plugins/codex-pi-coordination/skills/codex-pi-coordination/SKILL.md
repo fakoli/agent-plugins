@@ -47,7 +47,7 @@ overwrite. It does not provision providers, copy credentials or verify runtime
 behavior. Keep repeated settings in the profile; `--profile` on operational
 commands selects another existing profile.
 
-Discover the configured runtime's available provider/model IDs and the default
+Discover the configured runtime's available provider/model IDs and the current
 model's supported thinking levels:
 
 ```sh
@@ -55,9 +55,10 @@ python3 ../../scripts/coordinate.py capabilities --output /private/evidence/new-
 ```
 
 This uses the same owned disposable lifecycle with zero prompts, tools or
-extensions. It may select the configured model in its ephemeral child to query
-its levels. `capabilities_valid` reports metadata and cleanup validity, never
-task delivery, real-edit qualification or acceptance.
+extensions. It reports actual idle model/thinking settings without applying
+profile defaults or sending configuration setters. `capabilities_valid` reports
+metadata and cleanup validity, never task delivery, real-edit qualification or
+acceptance.
 
 ## Run and inspect
 
@@ -84,7 +85,7 @@ artifact hashes. Configuration readback must match before the sole task prompt;
 unsupported or clamped options admit zero task prompts. Prompt acknowledgement
 and `agent_end` alone do not prove settlement. Require `agent_settled`, an idle
 empty-queue readback, child exit and extension shutdown before checks.
-`rpc-events.jsonl` retains sanitized control evidence; `pi-stderr.log` is separate
+`rpc-events.jsonl` retains sanitized control evidence; `rpc/stderr.log` is separate
 diagnostic output, not protocol. Pi's handoff is a self-report.
 `delivery_valid` means the bounded return/cleanup contract completed; it grants
 no acceptance, merge, deployment or proof of research truth.

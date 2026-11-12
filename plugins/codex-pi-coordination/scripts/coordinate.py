@@ -356,7 +356,8 @@ class PiRpc:
         self.buffer, self.outgoing = b"", b""
         self.selector = selectors.DefaultSelector()
         self.events = (output / "pi-events.jsonl").open("xb")
-        self.stderr = (output / "pi-stderr.log").open("xb")
+        (output / "rpc").mkdir(mode=0o700)
+        self.stderr = (output / "rpc/stderr.log").open("xb")
         self.control = (output / "rpc-events.jsonl").open("x", encoding="utf-8")
         self.process = subprocess.Popen(command, cwd=workspace, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
         for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
@@ -528,6 +529,7 @@ def require_rpc_idle(state, effective=None, session_id=None):
     actual = {"provider": state["model"]["provider"], "model": state["model"]["id"], "thinking": state["thinkingLevel"]}
     if (effective is not None and actual != effective) or (session_id is not None and state["sessionId"] != session_id):
         raise ValueError("Pi effective model/thinking/session differs from the approved selection")
+    return actual
 
 
 def rpc_configuration_record(task, models, levels, effective, session_id, results):
@@ -538,7 +540,7 @@ def rpc_configuration_record(task, models, levels, effective, session_id, result
             "session_id": session_id, "session_file": None, "prompt_sent": task_run,
             "settled": task_run, "shutdown": "stdin-eof",
             "rpc_log_sha256": digest((results / "rpc-events.jsonl").read_bytes()),
-            "stderr_sha256": digest((results / "pi-stderr.log").read_bytes())}
+            "stderr_sha256": digest((results / "rpc/stderr.log").read_bytes())}
 
 
 def run_rpc(root, task, launch, deadline, env):
@@ -552,8 +554,8 @@ def run_rpc(root, task, launch, deadline, env):
         initial_request = rpc.send("get_state")
         models = rpc.wait(models_request)["models"]
         initial = rpc.wait(initial_request)
-        require_rpc_idle(initial)
-        effective = desired_configuration(task, models)
+        observed = require_rpc_idle(initial)
+        effective = observed if metadata else desired_configuration(task, models)
         model_changed = initial["model"] != {"provider": effective["provider"], "id": effective["model"]}
         if model_changed:
             selected = rpc.call("set_model", provider=effective["provider"], modelId=effective["model"])
@@ -644,8 +646,9 @@ def verify_rpc_configuration(results, task):
     if [request["command"] for _index, request in requests[:2]] != ["get_available_models", "get_state"]:
         raise ValueError("RPC metadata preflight missing")
     models, initial = data(0)["models"], data(1)
-    require_rpc_idle(initial)
-    effective = desired_configuration(task, models)
+    observed = require_rpc_idle(initial)
+    metadata = task["operation"] == "capabilities"
+    effective = observed if metadata else desired_configuration(task, models)
     target_model = {"provider": effective["provider"], "id": effective["model"]}
     changed = initial["model"] != target_model
     expected = [("get_available_models", {}), ("get_state", {})]
@@ -662,7 +665,6 @@ def verify_rpc_configuration(results, task):
         expected.append(("set_thinking_level", {"level": effective["thinking"]}))
     admitted_index = len(expected)
     expected.append(("get_state", {}))
-    metadata = task["operation"] == "capabilities"
     if not metadata:
         expected += [("prompt", {"message_sha256": digest(RPC_PROMPT.encode())}), ("get_state", {})]
     if [(request["command"], request["arguments"]) for _index, request in requests] != expected:
@@ -789,7 +791,7 @@ def verify_return(results, task, source_files, run_id):
         if receipt.get("configuration") != configuration:
             raise ValueError("Worker configuration differs from the verified RPC return")
         if metadata:
-            if set(actual) != {"worker-receipt.json", "rpc-events.jsonl", "pi-events.jsonl", "pi-stderr.log", "rpc-configuration.json"} or task["writable_paths"] or task["checks"]:
+            if set(actual) != {"worker-receipt.json", "rpc-events.jsonl", "pi-events.jsonl", "rpc/stderr.log", "rpc-configuration.json"} or task["writable_paths"] or task["checks"]:
                 raise ValueError("Metadata return contains task execution artifacts")
             return receipt
     report = read_json(results / "model-report.json")
@@ -1153,7 +1155,7 @@ def verify_recovered_artifacts(results, task, source_files):
     actual = snapshot(results)
     allowed = {"worker-receipt.json", "model-report.json", "pi-events.jsonl", "extension-events.jsonl", "changes.json", "changes.patch"}
     if task["version"] == 2:
-        allowed |= {"rpc-events.jsonl", "pi-stderr.log", "rpc-configuration.json"}
+        allowed |= {"rpc-events.jsonl", "rpc/stderr.log", "rpc-configuration.json"}
     allowed.update(check["name"] + suffix for check in task["checks"] for suffix in (".started.json", ".result.json", ".log"))
     if any(name not in allowed and not name.startswith("changed-files/") for name in actual):
         raise ValueError("Unexpected recovered artifact")
@@ -1167,7 +1169,7 @@ def verify_recovered_artifacts(results, task, source_files):
     if "acceptance" in worker_receipt and worker_receipt["acceptance"] != "not_granted":
         raise ValueError("Recovered worker claims unauthorized acceptance")
     if task["version"] == 2:
-        for name in ("rpc-events.jsonl", "pi-stderr.log"):
+        for name in ("rpc-events.jsonl", "rpc/stderr.log"):
             if len(actual.get(name, b"")) > MAX_OUTPUT_BYTES:
                 raise ValueError("Recovered RPC output exceeds limit")
         if "rpc-configuration.json" in actual:

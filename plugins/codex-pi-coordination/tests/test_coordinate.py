@@ -80,6 +80,7 @@ requests_file = pathlib.Path(__file__).with_suffix('.requests.jsonl')
 model = {'provider':'example','id':'model','headers':{'Authorization':'synthetic-private-marker'},'baseUrl':'https://synthetic.invalid/private'}
 thinking = 'high'
 levels = ['off','minimal','low','medium','high','xhigh','max']
+if behavior=='off-only': thinking='off';levels=['off']
 held = None
 def change_thinking(level):
     global thinking
@@ -611,11 +612,11 @@ class RpcTests(unittest.TestCase):
                 self.assertFalse(any(request["type"] == "prompt" for request in self.requests(root)))
                 self.assertFalse((root / "results/model-report.json").exists())
 
-    def test_native_configuration_events_bind_setters_and_metadata_defaults(self):
+    def test_native_configuration_events_bind_setters_without_changing_metadata_defaults(self):
         cases = [("thinking", {"thinking": "low"}, False, "high", ["set_thinking_level"]),
                  ("model", {"provider": "second", "model": "model-two", "thinking": "max"}, False, "high", ["set_model", "set_thinking_level"]),
                  ("same-value", {}, False, "high", []),
-                 ("metadata", {}, True, "low", ["set_thinking_level"])]
+                 ("metadata", {}, True, "low", [])]
         for name, options, metadata, default_thinking, expected in cases:
             with self.subTest(case=name):
                 root = self.prepare(name=name, options=options, metadata=metadata)
@@ -673,7 +674,7 @@ class RpcTests(unittest.TestCase):
     def test_stderr_backpressure_is_drained_without_becoming_protocol(self):
         root = self.prepare(behavior="noisy")
         self.assertEqual(coordinate.worker(root), 0)
-        self.assertGreater((root / "results/pi-stderr.log").stat().st_size, 65536)
+        self.assertGreater((root / "results/rpc/stderr.log").stat().st_size, 65536)
         self.assertNotIn(b"synthetic diagnostic", (root / "results/rpc-events.jsonl").read_bytes())
         coordinate.verify_return(root / "results", coordinate.read_json(root / "task.json"), {"answer.txt": b"before\n"}, "run-one")
 
@@ -714,6 +715,42 @@ class RpcTests(unittest.TestCase):
         self.assertEqual(receipt["outcome"], "capabilities")
         self.assertFalse(receipt["configuration"]["prompt_sent"])
         self.assertFalse(any(request["type"] in {"prompt", "set_model", "set_thinking_level"} for request in self.requests(root)))
+
+    def test_metadata_reports_off_only_model_without_applying_profile_defaults(self):
+        for index, default_model in enumerate(["example/model", "unavailable/profile-default"]):
+            with self.subTest(default_model=default_model):
+                root = self.prepare(name=str(index), behavior="off-only", metadata=True)
+                task = coordinate.read_json(root / "task.json")
+                task["runtime_defaults"]["model"] = default_model
+                dump(root / "task.json", task)
+                self.assertEqual(coordinate.worker(root), 0)
+                receipt = coordinate.verify_return(root / "results", task, {"answer.txt": b"before\n"}, "run-one")
+                self.assertEqual(receipt["configuration"]["supported_thinking_levels"], ["off"])
+                self.assertEqual(receipt["configuration"]["effective"], {"provider": "example", "model": "model", "thinking": "off"})
+                self.assertEqual([request["type"] for request in self.requests(root)], ["get_available_models", "get_state", "get_available_thinking_levels", "get_state"])
+        task_run = self.prepare(name="task-run", behavior="off-only")
+        self.assertEqual(coordinate.worker(task_run), 1)
+        self.assertFalse(any(request["type"] == "prompt" for request in self.requests(task_run)))
+
+    def test_check_named_pi_stderr_keeps_independent_diagnostics_and_recovery_bindings(self):
+        for exit_code in [0, 7]:
+            with self.subTest(exit_code=exit_code):
+                root = self.prepare(name=str(exit_code))
+                check = {"name": "pi-stderr", "argv": [sys.executable, "-c", f"print('declared check output'); raise SystemExit({exit_code})"], "timeout_seconds": 2}
+                task = coordinate.read_json(root / "task.json"); task["checks"] = [check]; dump(root / "task.json", task)
+                launch = coordinate.read_json(root / "launch.json"); launch["checks"] = [check]; dump(root / "launch.json", launch)
+                self.assertEqual(coordinate.worker(root), int(exit_code != 0))
+                self.assertEqual((root / "results/pi-stderr.log").read_bytes(), b"declared check output\n")
+                self.assertEqual((root / "results/rpc/stderr.log").read_bytes(), b"")
+                if exit_code == 0:
+                    coordinate.verify_return(root / "results", task, {"answer.txt": b"before\n"}, "run-one")
+                coordinate.verify_recovered_artifacts(root / "results", task, {"answer.txt": b"before\n"})
+        root = self.prepare(name="before-check", behavior="refused")
+        task = coordinate.read_json(root / "task.json"); task["checks"] = [check]; dump(root / "task.json", task)
+        launch = coordinate.read_json(root / "launch.json"); launch["checks"] = [check]; dump(root / "launch.json", launch)
+        self.assertEqual(coordinate.worker(root), 1)
+        self.assertFalse((root / "results/pi-stderr.log").exists())
+        coordinate.verify_recovered_artifacts(root / "results", task, {"answer.txt": b"before\n"})
 
     def test_trusted_check_observes_changed_bytes_after_shutdown(self):
         root = self.prepare()

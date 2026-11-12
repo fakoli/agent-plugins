@@ -19,7 +19,8 @@ python3 scripts/coordinate.py run task.json --output /private/evidence/new-run
 Identical settings are a no-op; conflicting defaults and symlinks refuse. It
 does not copy credentials or qualify the runtime. `capabilities` uses the owned
 disposable sandbox with zero prompts, tools or extensions, returning available
-provider/model IDs and the configured model's supported thinking levels.
+provider/model IDs and the current runtime model's supported thinking levels.
+It reports actual idle settings without applying profile model/thinking defaults.
 
 Version-2 tasks may add `run_options`: an exact `provider`/`model` pair,
 `thinking` alone, or both. Omitted options inherit the profile. `auto`, `dynamic`

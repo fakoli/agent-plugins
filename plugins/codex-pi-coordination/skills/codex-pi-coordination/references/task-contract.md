@@ -154,9 +154,10 @@ python3 ../../scripts/coordinate.py capabilities --output /private/evidence/new-
 
 `capabilities` accepts the normal `--profile` and `--lock-root` options. It uses
 the same owned disposable lifecycle with zero prompts, tools or extensions and
-returns only available provider/model IDs, the configured model's supported
-thinking levels and sanitized runtime identity. Any necessary model selection
-is confined to the ephemeral child; no global setting persists. Its CLI reports
+returns only available provider/model IDs, the current runtime model's supported
+thinking levels and sanitized actual idle settings. It sends no model or thinking
+setters and does not require profile defaults to be supported by the current model.
+Task runs still require exact supported options before their one prompt. Its CLI reports
 `capabilities_valid`; the receipt retains `delivery_valid: false` and
 `acceptance: not_granted`. Metadata discovery is separate from actual setup,
 model execution and real-edit qualification.
@@ -170,7 +171,9 @@ exclusive started/result records and a log SHA256; interruption never fabricates
 a successful terminal receipt.
 
 New return evidence includes `rpc-events.jsonl` (sanitized control transcript),
-`pi-stderr.log` (separate diagnostic output) and `rpc-configuration.json`.
+`rpc/stderr.log` (diagnostics outside the check-log namespace) and
+`rpc-configuration.json`. Check logs retain `<check-name>.log`, including the
+valid name `pi-stderr`; started/result receipts and hash checks remain unchanged.
 The worker receipt's `configuration` binds requested options, profile defaults,
 effective options, supported levels, ephemeral session ID, prompt admission,
 settlement, shutdown and RPC/stderr hashes. Input/task/source hashes bind this

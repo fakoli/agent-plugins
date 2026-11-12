@@ -83,6 +83,25 @@ test("v2 rejects malformed options and mismatched effective model or thinking", 
   }
 });
 
+test("explicit provider and model identifiers remain separate across slash boundaries", async (t) => {
+  for (const actual of [{ provider: "one", id: "two/three" }, { provider: "one/two", id: "three" }]) {
+    const f = fixture(t, { version: 2, operation: "run", run_options: { provider: "one/two", model: "three" }, runtime_defaults: { model: "one/two/three", thinking: "high" } });
+    const r = runtime(f.taskPath, f.workspace);
+    r.ctx.model = actual;
+    await r.emit("session_start");
+    const prompt = await r.emit("before_agent_start", { systemPrompt: "original" });
+    if (actual.provider === "one/two") {
+      assert.ok(prompt.systemPrompt);
+      assert.equal(events(f).at(-1).type, "run_configuration");
+    } else {
+      assert.equal(prompt, undefined);
+      assert.equal(r.ctx.aborted, 1);
+      assert.equal(events(f).at(-1).code, "configuration_mismatch");
+    }
+    await r.emit("session_shutdown");
+  }
+});
+
 test("each task kind injects context and returns a bound self-report without acceptance", async (t) => {
   for (const kind of ["implementation", "research", "review", "validation"]) {
     await t.test(kind, async (t) => {

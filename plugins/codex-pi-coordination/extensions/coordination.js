@@ -228,9 +228,11 @@ export default function coordinationExtension(pi) {
         return;
       }
       const options = loaded.task.run_options;
-      const selectedModel = options.provider ? `${options.provider}/${options.model}` : loaded.task.runtime_defaults.model;
+      const selectedModelMatches = options.provider
+        ? configuration.provider === options.provider && configuration.model === options.model
+        : `${configuration.provider}/${configuration.model}` === loaded.task.runtime_defaults.model;
       const selectedThinking = options.thinking ?? loaded.task.runtime_defaults.thinking;
-      if (`${configuration.provider}/${configuration.model}` !== selectedModel || configuration.thinking !== selectedThinking) {
+      if (!selectedModelMatches || configuration.thinking !== selectedThinking) {
         stop(ctx, "configuration_mismatch", "Effective Pi options differ from the approved task");
         return;
       }
