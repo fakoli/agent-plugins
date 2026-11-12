@@ -875,6 +875,97 @@ class RecoveryTests(unittest.TestCase):
                 with self.assertRaises(ValueError): coordinate.recovery_inputs(failed, self.profile)
                 for name, data in pristine.items(): (failed / name).write_bytes(data)
 
+    def test_partial_present_metadata_must_not_contradict_itself(self):
+        original = self.failed_run()
+        _, task, source, _ = coordinate.recovery_inputs(self.root / 'out', self.profile)
+        pristine = Path(original['remote_artifacts'])
+        cases = ['scope', 'duplicate-files', 'different-lists', 'returned-failed-check', 'returned-failed-check-no-summary', 'nonzero-pi-after-check', 'null-missing-report-hash', 'invalid-report-hash', 'false-change-match', 'nonboolean-change-match', 'null-model-status']
+        for kind in cases:
+            with self.subTest(kind=kind):
+                result = self.root / kind; shutil.copytree(pristine, result)
+                for name in ['changes.json', 'changes.patch']: (result / name).unlink()
+                receipt = coordinate.read_json(result / 'worker-receipt.json'); receipt.pop('artifact_sha256')
+                altered_task = copy.deepcopy(task)
+                if kind == 'scope': receipt['changed_files'] = ['unapproved.txt']
+                elif kind == 'duplicate-files': receipt['changed_files'] = ['answer.txt', 'answer.txt']; altered_task['writable_paths'] = ['answer.txt']
+                elif kind == 'different-lists':
+                    receipt['changed_files'] = ['answer.txt']; altered_task['writable_paths'] = ['answer.txt']
+                elif kind in ('returned-failed-check', 'returned-failed-check-no-summary'):
+                    receipt['outcome'] = 'returned'
+                    if kind.endswith('no-summary'): receipt.pop('checks_passed')
+                elif kind == 'nonzero-pi-after-check': receipt['pi_exit_code'] = 9
+                elif kind == 'null-missing-report-hash':
+                    (result / 'model-report.json').unlink(); receipt['model_report_sha256'] = None; receipt.pop('model_status')
+                elif kind == 'invalid-report-hash': receipt['model_report_sha256'] = 0
+                elif kind == 'false-change-match': receipt['model_report_matches_changes'] = False
+                elif kind == 'nonboolean-change-match': receipt['model_report_matches_changes'] = 1
+                elif kind == 'null-model-status': receipt['model_status'] = None; (result / 'model-report.json').unlink(); receipt.pop('model_report_sha256')
+                # Changing the task would independently break its hash. Rebind the
+                # report/events so list scope/consistency remains the tested guard.
+                if altered_task != task:
+                    old_hash = coordinate.digest(json.dumps(task).encode()); new_hash = coordinate.digest(json.dumps(altered_task).encode())
+                    for name in ['model-report.json', 'extension-events.jsonl']:
+                        file = result / name; file.write_bytes(file.read_bytes().replace(old_hash.encode(), new_hash.encode()))
+                    receipt['model_report_sha256'] = coordinate.digest((result / 'model-report.json').read_bytes())
+                    receipt.pop('extension')
+                dump(result / 'worker-receipt.json', receipt)
+                with self.assertRaises(ValueError): coordinate.verify_recovered_artifacts(result, altered_task, source)
+
+    def test_nonzero_pi_before_checks_is_valid_partial_failure_evidence(self):
+        self.profile['pi_argv'][-1] = 'exit-seven'; dump(self.profile_path, self.profile)
+        task = task_template(); task['checks'] = [{'name': 'not-started', 'argv': [sys.executable, '-c', 'raise AssertionError("must not run")'], 'timeout_seconds': 2}]; dump(self.task_path, task)
+        original = self.run_fake()
+        result = self.recover()
+        self.assertTrue(result['recovery_valid'])
+        self.assertEqual(result['outcome'], 'recovered_partial')
+        self.assertEqual(result['evidence']['checks'], [{'name': 'not-started', 'state': 'unknown', 'exit_code': None}])
+        self.assertEqual(coordinate.read_json(self.root / 'recovered/results/worker-receipt.json')['pi_exit_code'], 7)
+        self.assertEqual(self.instances[-1].calls, ['start', 'download', 'stop'])
+        self.assertFalse(original['delivery_valid'])
+
+    def test_absent_terminal_worker_fields_remain_partial_unknown(self):
+        original = self.failed_run(partial=True)
+        results = Path(original['remote_artifacts'])
+        # Keep only a minimally attributed interrupted worker receipt. Presence
+        # checks must not turn unknown exit/status/change fields into requirements.
+        dump(results / 'worker-receipt.json', {'run_id': original['run_id'], 'task_id': original['task_id'], 'outcome': 'incomplete', 'checks': []})
+        receipt = self.recover()
+        self.assertTrue(receipt['recovery_valid'])
+        self.assertEqual(receipt['outcome'], 'recovered_partial')
+        self.assertIsNone(receipt['evidence']['checks'][0]['exit_code'])
+
+    def test_signal_handlers_restore_even_when_final_receipt_or_journal_fails(self):
+        for operation in ['run', 'recover']:
+            for destination in ['receipt', 'journal']:
+                with self.subTest(operation=operation, destination=destination):
+                    fixture = RecoveryTests(); fixture.setUp()
+                    previous = {sig: coordinate.signal.getsignal(sig) for sig in (coordinate.signal.SIGINT, coordinate.signal.SIGTERM)}
+                    try:
+                        if operation == 'recover': fixture.failed_run()
+                        output_name = 'failed-finalization'
+                        target = fixture.root / output_name / 'receipt.json'
+                        journal = fixture.root / 'locks' / (coordinate.digest(b'sandbox-id') + '.json')
+                        original_new = coordinate.write_new_json; original_write = Path.write_text
+                        def fail_new(path, value):
+                            if destination == 'receipt' and Path(path) == target: raise OSError('injected final receipt persistence failure')
+                            return original_new(path, value)
+                        def fail_write(path, data, *args, **kwargs):
+                            if destination == 'journal' and path == journal and 'ended_at' in json.loads(data): raise OSError('injected final journal persistence failure')
+                            return original_write(path, data, *args, **kwargs)
+                        with mock.patch.object(coordinate, 'write_new_json', fail_new), mock.patch.object(Path, 'write_text', fail_write):
+                            with self.assertRaises(OSError):
+                                fixture.run_fake(name=output_name) if operation == 'run' else fixture.recover(output=output_name)
+                        self.assertEqual({sig: coordinate.signal.getsignal(sig) for sig in previous}, previous)
+                        self.assertEqual(fixture.instances[-1].calls.count('stop'), 1)
+                        self.assertEqual(fixture.instances[-1].state['phase'], 'Stopped')
+                        if destination == 'journal':
+                            self.assertFalse(coordinate.read_json(journal)['cleanup_complete'])
+                            with self.assertRaises(ValueError): fixture.run_fake(name='blocked-reuse')
+                    finally:
+                        for sig, handler in previous.items(): coordinate.signal.signal(sig, handler)
+                        fixture.doCleanups()
+
+
     def test_cli_reports_recovery_separately_from_delivery(self):
         self.failed_run()
         with mock.patch.object(coordinate, 'OpenShellOwner', self.recovery_factory()), contextlib.redirect_stdout(io.StringIO()) as stdout:

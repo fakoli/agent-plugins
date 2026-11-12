@@ -467,6 +467,21 @@ def exclusive_owner(profile, lock_root):
         yield lock_root / (key + ".json")
 
 
+@contextlib.contextmanager
+def owner_interruptions():
+    """Restore caller handlers even when cleanup or receipt persistence fails."""
+    previous_handlers = {}
+    def interrupted(_signum, _frame):
+        raise KeyboardInterrupt("Owner cancellation requested")
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[sig] = signal.signal(sig, interrupted)
+        yield previous_handlers
+    finally:
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
+
+
 def start_owned_instance(owner, profile, receipt, save_journal):
     """Bind only a fresh Ready main observed after a successful start RPC."""
     admitted_main = receipt["sandbox_before"]["main_process_instance_id"]
@@ -540,15 +555,11 @@ def run_task(task_file, profile_file, output, lock_root):
         def save_journal():
             journal.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
         save_journal()  # Persist uncertain custody BEFORE the start RPC.
-        previous_handlers = {}
-        def interrupted(_signum, _frame):
-            raise KeyboardInterrupt("Owner cancellation requested")
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            previous_handlers[sig] = signal.signal(sig, interrupted)
-        try:
-            start_owned_instance(owner, profile, receipt, save_journal)
-            owner.command("upload", "--no-git-ignore", profile["sandbox_name"], str(archive_path), remote_archive)
-            bootstrap = """import pathlib,tarfile,hashlib,sys
+        with owner_interruptions() as previous_handlers:
+            try:
+                start_owned_instance(owner, profile, receipt, save_journal)
+                owner.command("upload", "--no-git-ignore", profile["sandbox_name"], str(archive_path), remote_archive)
+                bootstrap = """import pathlib,tarfile,hashlib,sys
 p=pathlib.Path(sys.argv[1]); r=pathlib.Path(sys.argv[2])
 assert hashlib.sha256(p.read_bytes()).hexdigest()==sys.argv[3]
 assert sum(f.stat().st_size for f in r.parent.rglob('*') if f.is_file()) < 1024*1024*1024, 'retained sandbox workspace limit'
@@ -559,34 +570,32 @@ with tarfile.open(p) as archive:
   target=r/m.name; target.parent.mkdir(parents=True,exist_ok=True); target.write_bytes(archive.extractfile(m).read()); target.chmod(m.mode & 0o777)
 (r/'workspace').mkdir(exist_ok=True); (r/'results').mkdir(); p.unlink()
 """
-            python = profile.get("python", "python3")
-            owner.verify()
-            owner.command("exec", profile["sandbox_name"], "--no-login-shell", "--no-tty", "--timeout", "60", "--", python, "-c", bootstrap, remote_archive, remote, receipt["input_sha256"])
-            owner.verify()
-            command = [*owner.argv, "sandbox", "exec", profile["sandbox_name"], "--no-login-shell", "--no-tty", "--timeout", str(launch["wall_seconds"] + 30), "--", python, remote + "/coordinate.py", "worker", remote]
-            receipt["exec_exit_code"] = execute_to_log(command, output, output / "owner-exec.log", launch["wall_seconds"] + 45)
-            if receipt["exec_exit_code"] != 0:
-                raise ValueError("Remote worker failed; stop immediately before collecting artifacts")
-            owner.verify()
-            owner.command("download", profile["sandbox_name"], remote + "/results", str(output / "results"))
-            receipt["download_complete"] = True
-            worker_receipt = verify_return(output / "results", native_task, files, run_id)
-            receipt["worker"] = worker_receipt
-            receipt["artifacts_verified"] = True
-            receipt["outcome"] = worker_receipt["outcome"]
-        except BaseException as error:
-            receipt["error"] = str(error)
-        finally:
-            for sig in previous_handlers:
-                signal.signal(sig, signal.SIG_IGN)
-            cleanup_owner(owner, profile, receipt, protected)
-            receipt["ended_at"] = utc_now()
-            receipt["delivery_valid"] = receipt["cleanup_complete"] and receipt.get("protected_unchanged", False) and receipt.get("artifacts_verified", False) and receipt.get("exec_exit_code") == 0 and receipt["outcome"] == "returned"
-            receipt["acceptance"] = "not_granted"
-            save_journal()
-            write_new_json(output / "receipt.json", receipt)
-            for sig, handler in previous_handlers.items():
-                signal.signal(sig, handler)
+                python = profile.get("python", "python3")
+                owner.verify()
+                owner.command("exec", profile["sandbox_name"], "--no-login-shell", "--no-tty", "--timeout", "60", "--", python, "-c", bootstrap, remote_archive, remote, receipt["input_sha256"])
+                owner.verify()
+                command = [*owner.argv, "sandbox", "exec", profile["sandbox_name"], "--no-login-shell", "--no-tty", "--timeout", str(launch["wall_seconds"] + 30), "--", python, remote + "/coordinate.py", "worker", remote]
+                receipt["exec_exit_code"] = execute_to_log(command, output, output / "owner-exec.log", launch["wall_seconds"] + 45)
+                if receipt["exec_exit_code"] != 0:
+                    raise ValueError("Remote worker failed; stop immediately before collecting artifacts")
+                owner.verify()
+                owner.command("download", profile["sandbox_name"], remote + "/results", str(output / "results"))
+                receipt["download_complete"] = True
+                worker_receipt = verify_return(output / "results", native_task, files, run_id)
+                receipt["worker"] = worker_receipt
+                receipt["artifacts_verified"] = True
+                receipt["outcome"] = worker_receipt["outcome"]
+            except BaseException as error:
+                receipt["error"] = str(error)
+            finally:
+                for sig in previous_handlers:
+                    signal.signal(sig, signal.SIG_IGN)
+                cleanup_owner(owner, profile, receipt, protected)
+                receipt["ended_at"] = utc_now()
+                receipt["delivery_valid"] = receipt["cleanup_complete"] and receipt.get("protected_unchanged", False) and receipt.get("artifacts_verified", False) and receipt.get("exec_exit_code") == 0 and receipt["outcome"] == "returned"
+                receipt["acceptance"] = "not_granted"
+                save_journal()
+                write_new_json(output / "receipt.json", receipt)
     return receipt
 
 
@@ -674,8 +683,25 @@ def verify_recovered_artifacts(results, task, source_files):
             raise ValueError("Recovered model report does not bind this task")
         if not isinstance(report.get("changed_files"), list) or any(not isinstance(name, str) for name in report["changed_files"]) or set(report["changed_files"]) - set(task["writable_paths"]):
             raise ValueError("Recovered report changed-file scope mismatch")
-    if "model_report_sha256" in worker_receipt and worker_receipt["model_report_sha256"] != manifest.get("model-report.json"):
-        raise ValueError("Recovered model report bytes mismatch")
+    if "model_report_sha256" in worker_receipt:
+        recorded_hash = worker_receipt["model_report_sha256"]
+        if not isinstance(recorded_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", recorded_hash) or recorded_hash != manifest.get("model-report.json"):
+            raise ValueError("Recovered model report bytes mismatch")
+    for record in (worker_receipt, report):
+        if "changed_files" in record:
+            names = record["changed_files"]
+            if not isinstance(names, list) or any(not isinstance(name, str) for name in names) or len(set(names)) != len(names):
+                raise ValueError("Recovered changed-file list is invalid")
+            if set(relative_file(name) for name in names) - set(task["writable_paths"]):
+                raise ValueError("Recovered changed-file list exceeds scope")
+    if "changed_files" in worker_receipt and "changed_files" in report:
+        lists_match = sorted(worker_receipt["changed_files"]) == sorted(report["changed_files"])
+        if not lists_match:
+            raise ValueError("Recovered worker/report changed-file binding mismatch")
+        if "model_report_matches_changes" in worker_receipt and worker_receipt["model_report_matches_changes"] is not lists_match:
+            raise ValueError("Recovered change-match summary contradicts present lists")
+    if "model_report_matches_changes" in worker_receipt and type(worker_receipt["model_report_matches_changes"]) is not bool:
+        raise ValueError("Recovered change-match summary must be boolean")
     events = None
     if "events" in worker_receipt:
         if "pi-events.jsonl" not in actual:
@@ -725,8 +751,20 @@ def verify_recovered_artifacts(results, task, source_files):
         expected_passed = all(result["exit_code"] == 0 for result in completed_results) if completed_results else None
         if len(completed_results) != len(task["checks"]) or worker_receipt["checks_passed"] is not expected_passed:
             raise ValueError("Recovered check summary contradicts command results")
-    if "model_status" in worker_receipt and worker_receipt["model_status"] != report.get("status"):
+    if "model_status" in worker_receipt and (not isinstance(worker_receipt["model_status"], str) or worker_receipt["model_status"] not in {"completed", "blocked", "failed"} or worker_receipt["model_status"] != report.get("status")):
         raise ValueError("Recovered model status contradicts its report")
+    # These fields are produced only after Pi exits zero. A partial export may
+    # omit records, but cannot reverse the worker's already-observed ordering.
+    if worker_receipt.get("pi_exit_code", 0) != 0:
+        after_pi_fields = {"events", "extension", "model_report_sha256", "changed_files", "model_report_matches_changes", "checks_passed", "model_status"}
+        has_check_artifacts = any(check["name"] + suffix in actual for check in task["checks"] for suffix in (".started.json", ".result.json", ".log"))
+        if after_pi_fields & worker_receipt.keys() or has_check_artifacts or completed_results:
+            raise ValueError("Recovered post-Pi records contradict its nonzero exit")
+    if worker_receipt.get("outcome") == "returned":
+        if worker_receipt.get("pi_exit_code", 0) != 0 or any(result["exit_code"] != 0 for result in completed_results) or worker_receipt.get("checks_passed") is False or worker_receipt.get("model_report_matches_changes") is False or any(record.get(key, "completed") != "completed" for record, key in ((worker_receipt, "model_status"), (report, "status"))):
+            raise ValueError("Recovered returned outcome contradicts present failure evidence")
+    if worker_receipt.get("outcome") == "failed" and worker_receipt.get("model_status") == "completed" and "checks_passed" in worker_receipt and worker_receipt["checks_passed"] is not False and worker_receipt.get("model_report_matches_changes") is True:
+        raise ValueError("Recovered failed outcome contradicts present completion evidence")
     has_changes = "changes.json" in actual
     if has_changes:
         if "changes.patch" not in actual:
@@ -786,30 +824,24 @@ def recover_task(failed_directory, profile_file, output, lock_root):
         def save_journal():
             journal.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
         save_journal()
-        previous_handlers = {}
-        def interrupted(_signum, _frame):
-            raise KeyboardInterrupt("Owner cancellation requested")
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            previous_handlers[sig] = signal.signal(sig, interrupted)
-        try:
-            start_owned_instance(owner, profile, receipt, save_journal)
-            owner.verify()
-            owner.command("download", profile["sandbox_name"], receipt["remote_artifacts"], str(output / "results"))
-            receipt["download_complete"] = True
-            receipt["evidence"] = verify_recovered_artifacts(output / "results", task, source_files)
-            receipt["outcome"] = "recovered_" + receipt["evidence"]["evidence_status"]
-        except BaseException as error:
-            receipt["error"] = str(error)
-        finally:
-            for sig in previous_handlers:
-                signal.signal(sig, signal.SIG_IGN)
-            cleanup_owner(owner, profile, receipt, protected)
-            receipt["ended_at"] = utc_now()
-            receipt["recovery_valid"] = receipt["cleanup_complete"] and receipt.get("protected_unchanged", False) and receipt.get("download_complete", False) and receipt.get("evidence", {}).get("available_bindings_valid", False)
-            save_journal()
-            write_new_json(output / "receipt.json", receipt)
-            for sig, handler in previous_handlers.items():
-                signal.signal(sig, handler)
+        with owner_interruptions() as previous_handlers:
+            try:
+                start_owned_instance(owner, profile, receipt, save_journal)
+                owner.verify()
+                owner.command("download", profile["sandbox_name"], receipt["remote_artifacts"], str(output / "results"))
+                receipt["download_complete"] = True
+                receipt["evidence"] = verify_recovered_artifacts(output / "results", task, source_files)
+                receipt["outcome"] = "recovered_" + receipt["evidence"]["evidence_status"]
+            except BaseException as error:
+                receipt["error"] = str(error)
+            finally:
+                for sig in previous_handlers:
+                    signal.signal(sig, signal.SIG_IGN)
+                cleanup_owner(owner, profile, receipt, protected)
+                receipt["ended_at"] = utc_now()
+                receipt["recovery_valid"] = receipt["cleanup_complete"] and receipt.get("protected_unchanged", False) and receipt.get("download_complete", False) and receipt.get("evidence", {}).get("available_bindings_valid", False)
+                save_journal()
+                write_new_json(output / "receipt.json", receipt)
     return receipt
 
 
