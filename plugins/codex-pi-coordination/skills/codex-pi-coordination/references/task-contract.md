@@ -72,9 +72,9 @@ disposable sandbox is started; cleanup stops that owned resource.
 identity. It does not stop or adopt running resources. Failed or nonzero
 OpenShell execution, timeout and cancellation immediately enter managed stop;
 the runner skips artifact download. `receipt.json` retains `remote_artifacts`
-so the runtime owner can recover evidence after stopped custody is confirmed.
+for the supported `recover` command after stopped custody is confirmed.
 Do not collect remote artifacts while failed work may still be active. The
-runtime owner handles recovery and retention. Remote runs remain for diagnosis;
+runtime owner handles retention. Remote runs remain for diagnosis;
 preparation refuses when retained run data reaches 1 GiB.
 
 ## Return and trust
@@ -108,3 +108,39 @@ activation, records missing-tool refusal and blocks further tools. Pi 0.87.1
 print/JSON mode does not wire a shutdown callback for `ctx.shutdown()`, so this
 refusal does not guarantee zero model requests. The runner's wall deadline and
 managed OpenShell stop remain the process boundary.
+
+## Failed-run recovery
+
+`python3 ../../scripts/coordinate.py recover FAILED_RUN --output NEW_DIRECTORY`
+uses the normal `--profile` and `--lock-root` options. Keep the failed directory's
+`started.json`, `receipt.json` and `inputs.tar` unchanged. Recovery validates their
+hashes, safe archive members, task/source bindings and derived remote results
+path before any lifecycle action. The latest owner journal must bind that failed
+run and input with completed Stopped custody; a newer assignment, active owner,
+identity drift or competing lock refuses. A worker that returned work but failed
+cleanup may be recovered after reconciliation; an already-valid delivery may not.
+
+The owner must qualify the existing sandbox entrypoint as idle on restart. The
+runner starts a fresh Ready main instance and performs only a native download,
+then verifies its identity, stops it and reads back protected resources. It does
+not upload, exec, rerun Pi or rerun checks. If a start fails before the fresh
+instance is bound, an unexpected main is not stopped; custody remains unresolved.
+Unknown cleanup blocks another run until supported Stopped reconciliation. A
+retry retains the original failed-run identity even after recovery reconciliation.
+Original inputs/receipts and the previous journal are retained separately.
+
+The recovery receipt always declares `task_delivery_valid: false`,
+`delivery_valid: false` and `acceptance: not_granted`. `recovery_valid: true` and
+CLI exit zero denote completed retrieval, available-record validation, stopped
+cleanup and unchanged protected resources only. `recovered_complete` means all
+declared check terminal records and worker bindings are present; nonzero exits
+remain failures. `recovered_partial` reports absent terminal fields as unknown.
+A present manifest, task/check/model/source/patch binding that disagrees with its
+bytes fails recovery. Raw interrupted logs lacking terminal bindings are retained
+as partial diagnostic evidence, never passed through the successful-return gate.
+
+Returned artifacts have the same regular-file, 64 MiB, 10,000-file and log bounds.
+These checks occur after native download. The download timeout is not a hard
+pre-download byte or storage quota, and same-user hashes are not an independent
+issuer attestation. This is recovery from an exclusively owned trusted runtime,
+not arbitrary historical sandbox browsing or hostile-output containment.

@@ -443,6 +443,31 @@ for(const event of [{type:'tool_execution_start',toolCallId:'handoff-1',toolName
             coordinate.verify_return(pristine, task, source, "unrelated-run")
 
 
+class RecoveryChangeTests(unittest.TestCase):
+    setUp = WorkerTests.setUp
+    prepare = WorkerTests.prepare
+
+    def test_failed_check_change_bindings_remain_strict(self):
+        check = {'name': 'proof', 'argv': [sys.executable, '-c', 'raise SystemExit(9)'], 'timeout_seconds': 2}
+        root = self.prepare(behavior='change', checks=[check])
+        self.assertEqual(coordinate.worker(root), 1)
+        task = coordinate.read_json(root / 'task.json')
+        source = {'answer.txt': b'before\n'}
+        result = coordinate.verify_recovered_artifacts(root / 'results', task, source)
+        self.assertEqual(result['evidence_status'], 'complete')
+        self.assertEqual(result['checks'][0]['exit_code'], 9)
+        for kind in ['base', 'bytes', 'patch', 'scope']:
+            with self.subTest(kind=kind):
+                output = root / kind; shutil.copytree(root / 'results', output)
+                if kind == 'base':
+                    changes = coordinate.read_json(output / 'changes.json'); changes[0]['before_sha256'] = '0' * 64; dump(output / 'changes.json', changes)
+                elif kind == 'bytes': (output / 'changed-files/answer.txt').write_text('forged')
+                elif kind == 'patch': (output / 'changes.patch').write_text('forged')
+                else: (output / 'changed-files/unapproved.txt').write_text('forged')
+                receipt = coordinate.read_json(output / 'worker-receipt.json'); receipt['artifact_sha256'] = {name: coordinate.digest(raw) for name, raw in coordinate.snapshot(output).items() if name != 'worker-receipt.json'}; dump(output / 'worker-receipt.json', receipt)
+                with self.assertRaises(ValueError): coordinate.verify_recovered_artifacts(output, task, source)
+
+
 class OwnerTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(); self.addCleanup(self.temporary.cleanup)
@@ -597,6 +622,252 @@ class OwnerTests(unittest.TestCase):
             code = "import importlib.util,pathlib,sys; s=importlib.util.spec_from_file_location('c',sys.argv[1]); c=importlib.util.module_from_spec(s); s.loader.exec_module(c)\ntry:\n with c.exclusive_owner({'sandbox_id':'sandbox-id'},pathlib.Path(sys.argv[2])): raise SystemExit(0)\nexcept BlockingIOError: raise SystemExit(23)\n"
             result = subprocess.run([sys.executable, "-c", code, str(SCRIPT), str(self.root / "locks")], capture_output=True, timeout=5)
             self.assertEqual(result.returncode, 23, result.stderr.decode())
+
+
+class RecoveryTests(unittest.TestCase):
+    setUp = OwnerTests.setUp
+    factory = OwnerTests.factory
+    run_fake = OwnerTests.run_fake
+
+    def failed_run(self, *, partial=False, returned=False):
+        if not returned:
+            task = task_template()
+            task['checks'] = [{'name': 'intentional-failure', 'argv': [sys.executable, '-c', "print('failure evidence'); raise SystemExit(19)"], 'timeout_seconds': 2}]
+            dump(self.task_path, task)
+        receipt = self.run_fake('stop-error' if returned else 'normal')
+        self.assertFalse(receipt['delivery_valid'])
+        if partial:
+            results = Path(receipt['remote_artifacts'])
+            for name in ['worker-receipt.json', 'intentional-failure.result.json', 'changes.json', 'changes.patch']:
+                (results / name).unlink()
+        return receipt
+
+    def recovery_factory(self, mode='normal'):
+        test = self
+        journal_path = self.root / 'locks' / (coordinate.digest(b'sandbox-id') + '.json')
+        prior = coordinate.read_json(journal_path)
+        class RecoveryOwner(coordinate.OpenShellOwner):
+            def __init__(self, profile):
+                super().__init__(profile)
+                self.state = copy.deepcopy(prior.get('sandbox_after', prior.get('sandbox_running')))
+                self.calls = []; test.instances.append(self)
+                if mode == 'initial-active': self.state['phase'] = 'Ready'
+                if mode == 'initial-wrong-main': self.state['main_process_instance_id'] = 'unrelated-main'
+                if mode == 'initial-wrong-id': self.state['id'] = 'unrelated-sandbox'
+                if mode == 'reconciled': self.state['phase'] = 'Stopped'
+            def get(self, name=None):
+                if name == 'protected':
+                    return {'id': 'protected-id', 'name': name, 'phase': 'Ready', 'main_process_instance_id': 'changed' if mode == 'protected-drift' and self.calls else 'protected-main', 'restart_count': 0}
+                return copy.deepcopy(self.state)
+            def command(self, *args, timeout=60):
+                self.calls.append(args[0])
+                if args[0] == 'start':
+                    self.state.update(phase='Ready', main_process_instance_id='fresh-' + prior['run_id'] if mode != 'reused-main' else self.state['main_process_instance_id'])
+                    self.state['restart_count'] += 1
+                    if mode == 'start-error': raise subprocess.CalledProcessError(1, 'synthetic start')
+                elif args[0] == 'download':
+                    if mode == 'download-error': raise subprocess.CalledProcessError(1, 'synthetic download')
+                    if mode == 'timeout': raise subprocess.TimeoutExpired('synthetic download', timeout)
+                    if mode == 'cancel': raise KeyboardInterrupt('synthetic cancellation')
+                    shutil.copytree(args[-2], args[-1])
+                    if mode == 'replaced': self.state['main_process_instance_id'] = 'unowned-replacement'
+                    if mode == 'manifest-tamper': (Path(args[-1]) / 'intentional-failure.log').write_text('tampered')
+                elif args[0] == 'stop':
+                    if mode == 'stop-error': raise subprocess.CalledProcessError(1, 'synthetic stop')
+                    self.state['phase'] = 'Stopped'
+                else: raise AssertionError('Recovery must not launch ' + args[0])
+                return subprocess.CompletedProcess(args, 0, '', '')
+        return RecoveryOwner
+
+    def recover(self, mode='normal', output='recovered'):
+        with mock.patch.object(coordinate, 'OpenShellOwner', self.recovery_factory(mode)):
+            return coordinate.recover_task(self.root / 'out', self.profile_path, self.root / output, self.root / 'locks')
+
+    def test_nonzero_check_recovers_without_reexecution_or_task_success(self):
+        original = self.failed_run()
+        before = {name: (self.root / 'out' / name).read_bytes() for name in ['receipt.json', 'inputs.tar', 'started.json']}
+        remote = Path(original['remote_artifacts']).parent
+        model_calls = (remote / 'invocations.txt').read_bytes()
+        receipt = self.recover()
+        self.assertTrue(receipt['recovery_valid']); self.assertFalse(receipt['task_delivery_valid'])
+        self.assertFalse(receipt['delivery_valid']); self.assertEqual(receipt['acceptance'], 'not_granted')
+        self.assertEqual(receipt['outcome'], 'recovered_complete')
+        self.assertEqual(receipt['evidence']['checks'], [{'name': 'intentional-failure', 'state': 'completed', 'exit_code': 19}])
+        self.assertEqual(self.instances[-1].calls, ['start', 'download', 'stop'])
+        self.assertEqual((remote / 'invocations.txt').read_bytes(), model_calls)
+        self.assertEqual(before, {name: (self.root / 'out' / name).read_bytes() for name in before})
+        self.assertEqual(coordinate.read_json(self.root / 'recovered/prior-journal.json'), original)
+        original_task = json.loads(coordinate.safe_archive_files(before['inputs.tar'])['task.json'])
+        with self.assertRaises(ValueError): coordinate.verify_return(self.root / 'recovered/results', original_task, {}, original['run_id'])
+        self.assertEqual(receipt['sandbox_after']['phase'], 'Stopped')
+        self.assertNotEqual(receipt['sandbox_before']['main_process_instance_id'], receipt['sandbox_running']['main_process_instance_id'])
+
+    def test_partial_evidence_keeps_missing_exit_code_unknown(self):
+        self.failed_run(partial=True)
+        receipt = self.recover()
+        self.assertTrue(receipt['recovery_valid'])
+        self.assertEqual(receipt['outcome'], 'recovered_partial')
+        self.assertIsNone(receipt['evidence']['worker_outcome'])
+        self.assertEqual(receipt['evidence']['checks'][0], {'name': 'intentional-failure', 'state': 'unknown', 'exit_code': None})
+
+    def test_failed_cleanup_returned_worker_is_recoverable_after_reconcile(self):
+        original = self.failed_run(returned=True)
+        self.assertEqual(original['outcome'], 'returned')
+        self.assertFalse(original['cleanup_complete'])
+        arguments = ['reconcile', '--profile', str(self.profile_path), '--lock-root', str(self.root / 'locks')]
+        with mock.patch.object(coordinate, 'OpenShellOwner', self.recovery_factory('reconciled')), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(coordinate.main(arguments), 0)
+        self.assertTrue(self.recover()['recovery_valid'])
+
+    def test_refuses_successful_input_before_lifecycle(self):
+        self.run_fake()
+        with self.assertRaisesRegex(ValueError, 'unsuccessful'):
+            coordinate.recover_task(self.root / 'out', self.profile_path, self.root / 'recovered', self.root / 'locks')
+        self.assertEqual(len(self.instances), 1)
+
+    def test_recovery_retry_keeps_original_identity_after_reconcile(self):
+        original = self.failed_run()
+        failed = self.recover('stop-error')
+        self.assertFalse(failed['cleanup_complete'])
+        with self.assertRaises(ValueError): self.recover(output='unresolved')
+        arguments = ['reconcile', '--profile', str(self.profile_path), '--lock-root', str(self.root / 'locks')]
+        with mock.patch.object(coordinate, 'OpenShellOwner', self.recovery_factory('reconciled')), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(coordinate.main(arguments), 0)
+        result = self.recover(output='retry')
+        self.assertTrue(result['recovery_valid'])
+        self.assertEqual(result['failed_run_id'], original['run_id'])
+        self.assertEqual(result['failed_input_sha256'], original['input_sha256'])
+        with self.assertRaises(FileExistsError): self.recover(output='retry')
+
+    def test_input_tampering_and_newer_custody_refuse_before_start(self):
+        self.failed_run()
+        original = self.root / 'out/receipt.json'
+        pristine = original.read_bytes()
+        for key, value in [('input_sha256', '0' * 64), ('remote_artifacts', '/arbitrary/results'), ('run_id', '../escape')]:
+            with self.subTest(key=key):
+                receipt = json.loads(pristine); receipt[key] = value; dump(original, receipt)
+                with self.assertRaises(ValueError): self.recover(output=key)
+                original.write_bytes(pristine)
+        archive = self.root / 'out/inputs.tar'; archive_bytes = archive.read_bytes()
+        archive.write_bytes(archive_bytes + b'changed')
+        with self.assertRaises(ValueError): self.recover(output='changed-archive')
+        archive.write_bytes(archive_bytes)
+        journal = self.root / 'locks' / (coordinate.digest(b'sandbox-id') + '.json')
+        prior = coordinate.read_json(journal); prior['run_id'] = 'b' * 32; dump(journal, prior)
+        with self.assertRaises(ValueError): self.recover(output='newer')
+        self.assertEqual(self.instances[-1].calls, [])
+
+    def test_active_or_changed_owner_refuses_without_action(self):
+        self.failed_run()
+        for mode in ['initial-active', 'initial-wrong-main', 'initial-wrong-id']:
+            with self.subTest(mode=mode), self.assertRaises(ValueError): self.recover(mode, mode)
+            self.assertEqual(self.instances[-1].calls, [])
+
+    def test_download_faults_retain_cleanup_and_no_task_launch(self):
+        self.failed_run()
+        for mode in ['download-error', 'timeout', 'cancel', 'manifest-tamper', 'protected-drift']:
+            with self.subTest(mode=mode):
+                receipt = self.recover(mode, mode)
+                self.assertFalse(receipt['recovery_valid'])
+                self.assertTrue(receipt['cleanup_complete'])
+                self.assertTrue(set(self.instances[-1].calls) <= {'start', 'download', 'stop'})
+                if mode == 'protected-drift': self.assertFalse(receipt['protected_unchanged'])
+
+    def test_reused_main_is_not_a_fresh_recovery_owner(self):
+        self.failed_run()
+        receipt = self.recover('reused-main')
+        self.assertFalse(receipt['cleanup_complete'])
+        self.assertFalse(receipt['recovery_valid'])
+        self.assertEqual(self.instances[-1].calls, ['start'])
+
+    def test_replacement_is_not_stopped_and_blocks_reuse(self):
+        self.failed_run()
+        result = self.recover('replaced')
+        self.assertFalse(result['cleanup_complete']); self.assertFalse(result['recovery_valid'])
+        self.assertNotIn('stop', self.instances[-1].calls)
+        with self.assertRaises(ValueError): self.recover(output='retry')
+
+    def test_artifact_tampering_cannot_hide_behind_updated_manifest(self):
+        original = self.failed_run()
+        _, task, source, _ = coordinate.recovery_inputs(self.root / 'out', self.profile)
+        pristine = Path(original['remote_artifacts'])
+        for kind in ['check-argv', 'check-log', 'check-exit-type', 'model-task', 'worker-task', 'extension-task', 'unexpected', 'symlink', 'manifest', 'partial-extension']:
+            with self.subTest(kind=kind):
+                result = self.root / kind; shutil.copytree(pristine, result)
+                receipt = coordinate.read_json(result / 'worker-receipt.json')
+                if kind in ['check-argv', 'check-exit-type']:
+                    check = coordinate.read_json(result / 'intentional-failure.result.json')
+                    check['argv' if kind == 'check-argv' else 'exit_code'] = ['unapproved'] if kind == 'check-argv' else True
+                    dump(result / 'intentional-failure.result.json', check); receipt['checks'] = [check]
+                elif kind == 'check-log': (result / 'intentional-failure.log').write_text('forged')
+                elif kind == 'model-task':
+                    report = coordinate.read_json(result / 'model-report.json'); report['task_sha256'] = '0' * 64; dump(result / 'model-report.json', report)
+                    receipt['model_report_sha256'] = coordinate.digest((result / 'model-report.json').read_bytes())
+                elif kind == 'worker-task': receipt['task_id'] = 'wrong'
+                elif kind in ['extension-task', 'partial-extension']:
+                    events = (result / 'extension-events.jsonl').read_text(); (result / 'extension-events.jsonl').write_text(events.replace(task['run_id'], 'wrong'))
+                    if kind == 'partial-extension': receipt.pop('extension'); receipt.pop('events')
+                elif kind == 'unexpected': (result / 'extra.json').write_text('{}')
+                elif kind == 'symlink': (result / 'linked').symlink_to(self.task_path)
+                elif kind == 'manifest': receipt['artifact_sha256'] = {}
+                if kind != 'symlink' and kind != 'manifest': receipt['artifact_sha256'] = {name: coordinate.digest(raw) for name, raw in coordinate.snapshot(result).items() if name != 'worker-receipt.json'}
+                dump(result / 'worker-receipt.json', receipt)
+                with self.assertRaises(ValueError): coordinate.verify_recovered_artifacts(result, task, source)
+
+    def test_failed_start_never_stops_an_unbound_new_main(self):
+        self.failed_run()
+        receipt = self.recover('start-error')
+        self.assertFalse(receipt['cleanup_complete'])
+        self.assertNotIn('stop', self.instances[-1].calls)
+        self.assertNotIn('download', self.instances[-1].calls)
+        with self.assertRaises(ValueError): self.recover(output='retry')
+
+    def test_recovery_lock_and_unknown_custody_refuse(self):
+        self.failed_run()
+        with coordinate.exclusive_owner(self.profile, self.root / 'locks'):
+            with self.assertRaises(BlockingIOError): self.recover(output='locked')
+        journal = self.root / 'locks' / (coordinate.digest(b'sandbox-id') + '.json')
+        receipt = coordinate.read_json(journal); receipt['cleanup_complete'] = False; dump(journal, receipt)
+        with self.assertRaises(ValueError): self.recover(output='unknown')
+        self.assertEqual(self.instances[-1].calls, [])
+
+    def test_available_artifact_bounds_and_partial_log_tail(self):
+        original = self.failed_run(partial=True)
+        _, task, source, _ = coordinate.recovery_inputs(self.root / 'out', self.profile)
+        results = Path(original['remote_artifacts'])
+        extension = results / 'extension-events.jsonl'
+        with extension.open('ab') as stream: stream.write(b'{"interrupted":')
+        self.assertEqual(coordinate.verify_recovered_artifacts(results, task, source)['evidence_status'], 'partial')
+        with mock.patch.object(coordinate, 'MAX_FILES', 1), self.assertRaises(ValueError): coordinate.verify_recovered_artifacts(results, task, source)
+        with mock.patch.object(coordinate, 'MAX_SOURCE_BYTES', 10), self.assertRaises(ValueError): coordinate.verify_recovered_artifacts(results, task, source)
+        with mock.patch.object(coordinate, 'MAX_OUTPUT_BYTES', 1), self.assertRaises(ValueError): coordinate.verify_recovered_artifacts(results, task, source)
+
+    def test_archive_source_and_task_changes_refuse_even_with_resealed_input(self):
+        self.failed_run()
+        failed = self.root / 'out'
+        pristine = {name: (failed / name).read_bytes() for name in ['inputs.tar', 'started.json', 'receipt.json']}
+        for kind in ['task', 'source', 'members', 'unsafe']:
+            with self.subTest(kind=kind):
+                payload = coordinate.safe_archive_files(pristine['inputs.tar'])
+                if kind == 'task':
+                    task = json.loads(payload['task.json']); task['run_id'] = 'wrong'; payload['task.json'] = json.dumps(task).encode()
+                elif kind == 'source': payload['workspace/unbound.txt'] = b'changed'
+                elif kind == 'members': payload['unexpected'] = b'changed'
+                else: payload['../escape'] = b'changed'
+                raw = make_archive([(name, data, tarfile.REGTYPE) for name, data in payload.items()])
+                (failed / 'inputs.tar').write_bytes(raw)
+                for name in ['started.json', 'receipt.json']:
+                    value = json.loads(pristine[name]); value['input_sha256'] = coordinate.digest(raw); dump(failed / name, value)
+                with self.assertRaises(ValueError): coordinate.recovery_inputs(failed, self.profile)
+                for name, data in pristine.items(): (failed / name).write_bytes(data)
+
+    def test_cli_reports_recovery_separately_from_delivery(self):
+        self.failed_run()
+        with mock.patch.object(coordinate, 'OpenShellOwner', self.recovery_factory()), contextlib.redirect_stdout(io.StringIO()) as stdout:
+            code = coordinate.main(['recover', str(self.root / 'out'), '--profile', str(self.profile_path), '--output', str(self.root / 'recovered'), '--lock-root', str(self.root / 'locks')])
+        summary = json.loads(stdout.getvalue())
+        self.assertEqual(code, 0); self.assertTrue(summary['recovery_valid']); self.assertFalse(summary['task_delivery_valid'])
+        self.assertEqual(summary['acceptance'], 'not_granted')
 
 
 if __name__ == "__main__":
