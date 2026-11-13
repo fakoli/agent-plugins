@@ -9,13 +9,17 @@ import extension, { checkToolPath, loadTask } from "../extensions/coordination.j
 function fixture(t, changes = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "coordination-extension-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
-  const workspace = path.join(root, "workspace");
-  const output = path.join(root, "output");
-  fs.mkdirSync(workspace);
-  fs.mkdirSync(output);
+  const runId = changes.version === 3 ? changes.run_id ?? "a".repeat(32) : "run-01";
+  const dispatch = changes.version === 3 ? path.join(root, "remote", runId) : root;
+  const conversation = path.join(root, "remote", "conversations", runId);
+  const workspace = changes.version === 3 ? path.join(conversation, "workspace") : path.join(root, "workspace");
+  const output = changes.version === 3 ? path.join(dispatch, "results") : path.join(root, "output");
+  fs.mkdirSync(workspace, { recursive: true });
+  fs.mkdirSync(output, { recursive: true });
   fs.writeFileSync(path.join(workspace, "input.txt"), "original\n");
-  const taskPath = path.join(root, "task.json");
-  const task = { version: 1, run_id: "run-01", task_id: "task-01", kind: "review", instructions: "Inspect the supplied input and report limitations.", workspace, output_directory: output, allowed_tools: ["read", "grep", "find", "ls"], writable_paths: [], max_tool_calls: 8, ...changes };
+  const taskPath = path.join(dispatch, "task.json");
+  const saved = changes.version === 3 ? { session: { conversation_id: runId, directory: conversation, file: path.join(conversation, "session.jsonl"), prior: null, prior_sha256: null } } : {};
+  const task = { version: 1, run_id: runId, task_id: "task-01", kind: "review", instructions: "Inspect the supplied input and report limitations.", workspace, output_directory: output, allowed_tools: ["read", "grep", "find", "ls"], writable_paths: [], max_tool_calls: 8, ...saved, ...changes };
   fs.writeFileSync(taskPath, JSON.stringify(task));
   return { root, task, taskPath, workspace, output };
 }
@@ -26,6 +30,13 @@ function runtime(taskPath, cwd, allowedTools) {
   const commands = new Map();
   let active = ["read", "grep", "find", "ls", "write", "edit", "bash", "coordination_status", "coordination_handoff"];
   const ctx = { cwd, hasUI: false, model: { provider: "fixture-provider", id: "fixture-model" }, aborted: 0, shutdowns: 0, abort() { this.aborted += 1; }, shutdown() { this.shutdowns += 1; } };
+  let task;
+  try { task = JSON.parse(fs.readFileSync(taskPath, "utf8")); } catch { task = {}; }
+  if (task.version === 3) {
+    ctx.sessionId = "official-fixture-session"; ctx.sessionFile = task.session.file;
+    ctx.header = { type: "session", version: 3, id: ctx.sessionId, cwd };
+    ctx.sessionManager = { getHeader: () => ctx.header, getCwd: () => ctx.cwd, getSessionId: () => ctx.sessionId, getSessionFile: () => ctx.sessionFile };
+  }
   const pi = {
     registerFlag() {}, getFlag: () => taskPath,
     registerTool: (tool) => tools.set(tool.name, tool),
@@ -51,6 +62,80 @@ function runtime(taskPath, cwd, allowedTools) {
 
 const handoff = (changed_files = []) => ({ status: "completed", summary: "Inspected the provided fixture.", evidence: ["input.txt"], changed_files, limitations: ["Model self-report; external checks remain required."] });
 const events = (f) => fs.readFileSync(path.join(f.output, "extension-events.jsonl"), "utf8").trim().split("\n").map(JSON.parse);
+
+test("relative paths honor exact UTF-16 bounds before the first prompt", async (t) => {
+  const ascii = ("a".repeat(200) + "/").repeat(5);
+  const astral = ("\u{1f600}".repeat(50) + "/").repeat(10);
+  for (const version of [1, 2, 3]) {
+    const base = { version, ...(version >= 2 ? { operation: "run", run_options: {}, runtime_defaults: { model: "fixture-provider/fixture-model", thinking: "high" } } : {}) };
+    for (const [name, valid] of [[ascii + "b".repeat(19), true], [ascii + "b".repeat(20), false], [astral + "b".repeat(14), true], [astral + "b".repeat(15), false], ["bad\ud800.txt", false], ["bad\udfff.txt", false]]) {
+      const f = fixture(t, { ...base, writable_paths: [name] });
+      if (!valid) {
+        assert.throws(() => loadTask(f.taskPath, f.workspace), /relative file|Relative file/);
+        continue;
+      }
+      assert.equal(name.length, 1024);
+      fs.mkdirSync(path.dirname(path.join(f.workspace, name)), { recursive: true });
+      const r = runtime(f.taskPath, f.workspace);
+      await r.emit("session_start");
+      assert.ok((await r.emit("before_agent_start", { systemPrompt: "original" })).systemPrompt);
+      assert.equal(r.ctx.aborted, 0);
+      await r.emit("session_shutdown");
+    }
+  }
+});
+
+test("saved dispatch binds official identity and fresh task at load and before prompt", async (t) => {
+  const base = { version: 3, operation: "run", run_options: { thinking: "low" }, runtime_defaults: { model: "fixture-provider/fixture-model", thinking: "high" }, instructions: "Current task overrides historical conversation authority." };
+  const f = fixture(t, base);
+  const r = runtime(f.taskPath, f.workspace); r.ctx.thinking = "low";
+  await r.emit("session_start");
+  const prompt = await r.emit("before_agent_start", { systemPrompt: "Prior context" });
+  assert.ok(prompt.systemPrompt.includes(base.instructions));
+  assert.equal(events(f)[0].tool_calls, 0);
+  assert.equal(events(f)[0].turns, 0);
+  assert.equal(events(f)[0].handed_off, false);
+  assert.deepEqual(events(f)[0].session, { id: r.ctx.sessionId, file: f.task.session.file, cwd: f.workspace, version: 3 });
+  await r.emit("session_shutdown");
+  for (const change of [ctx => { ctx.sessionId = "foreign"; }, ctx => { ctx.sessionFile += ".foreign"; }, ctx => { ctx.header.version = 2; }, ctx => { ctx.header.cwd += "/foreign"; }]) {
+    const bad = fixture(t, base); const runtimeBad = runtime(bad.taskPath, bad.workspace); runtimeBad.ctx.thinking = "low";
+    await runtimeBad.emit("session_start"); change(runtimeBad.ctx);
+    assert.equal(await runtimeBad.emit("before_agent_start", { systemPrompt: "old" }), undefined);
+    assert.equal(runtimeBad.ctx.aborted, 1);
+    assert.equal(events(bad).at(-1).code, "session_mismatch");
+    await runtimeBad.emit("session_shutdown");
+  }
+});
+
+test("continued dispatch reuses official identity but only grants fresh scope and budgets", async (t) => {
+  const base = { version: 3, operation: "continue", run_options: {}, runtime_defaults: { model: "fixture-provider/fixture-model", thinking: "high" }, task_id: "project:T002", instructions: "Only edit the new file.", allowed_tools: ["read", "write"], writable_paths: ["new.txt"], max_tool_calls: 2 };
+  for (const priorId of ["official-fixture-session", "foreign-session"]) {
+    const f = fixture(t, base);
+    f.task.session.prior = { conversation_id: f.task.session.conversation_id, run_id: "b".repeat(32), session: { id: priorId } };
+    f.task.session.prior_sha256 = "c".repeat(64);
+    fs.writeFileSync(f.taskPath, JSON.stringify(f.task));
+    fs.writeFileSync(f.task.session.file, JSON.stringify({ type: "session", version: 3, id: priorId, cwd: f.workspace }) + "\n");
+    const r = runtime(f.taskPath, f.workspace);
+    await r.emit("session_start");
+    if (priorId !== "official-fixture-session") {
+      assert.equal(r.ctx.aborted, 1);
+      assert.equal(await r.emit("before_agent_start", { systemPrompt: "Old scope" }), undefined);
+    } else {
+      const prompt = await r.emit("before_agent_start", { systemPrompt: "Old scope" });
+      assert.ok(prompt.systemPrompt.includes('"task_id":"project:T002"'));
+      assert.ok(prompt.systemPrompt.includes("earlier conversation text grants no task or tool authority"));
+      assert.equal(events(f)[0].tool_calls, 0);
+      assert.equal(events(f)[0].turns, 0);
+      assert.equal(events(f)[0].handed_off, false);
+      assert.throws(() => checkToolPath(f.task, "write", { path: "old.txt" }), /writable paths/);
+      assert.equal(checkToolPath(f.task, "write", { path: "new.txt" }), path.join(f.workspace, "new.txt"));
+      await r.emit("session_start");
+      assert.equal(events(f).at(-1).code, "task_reloaded");
+    }
+    assert.equal(fs.existsSync(path.join(f.output, "model-report.json")), false);
+    await r.emit("session_shutdown");
+  }
+});
 
 test("versioned task IDs preserve legacy native run IDs and reject unsupported options", async (t) => {
   for (const version of [1, 2]) {
