@@ -66,18 +66,26 @@ def bounded_integer(value, label, maximum):
     return value
 
 
-def relative_file(value):
+def relative_path_structure(value):
+    """Validate spelling and safety without charging a transport namespace."""
     if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
         raise ValueError("Expected a relative file path")
     try:
-        units = len(value.encode("utf-16-le")) // 2
+        value.encode("utf-8")
     except UnicodeEncodeError:
         raise ValueError("Relative file path contains invalid Unicode") from None
-    if units > 1024 or re.search(r"[\u00A0\u2000-\u200A\u202F\u205F\u3000]", value):
-        raise ValueError("Relative file path exceeds native bounds or requires Unicode-space normalization")
+    if re.search(r"[\u00A0\u2000-\u200A\u202F\u205F\u3000]", value):
+        raise ValueError("Relative file path requires Unicode-space normalization")
     path = PurePosixPath(value)
     if value == "." or path.is_absolute() or any(p in ("..", ".git") for p in path.parts) or str(path) != value:
         raise ValueError("Unsafe relative file path")
+    return value
+
+
+def relative_file(value):
+    value = relative_path_structure(value)
+    if len(value.encode("utf-16-le")) // 2 > 1024:
+        raise ValueError("Relative file path exceeds native bounds")
     return value
 
 
@@ -140,14 +148,14 @@ def validate_run_options(options):
 
 
 def safe_archive_files(raw):
-    """Git archives are data; reject links, devices, duplicates and traversal."""
+    """Validate transport members; callers apply the native workspace limit."""
     files, total = {}, 0
     with tarfile.open(fileobj=io.BytesIO(raw)) as archive:
         for item in archive:
             if item.isdir():
-                relative_file(item.name.rstrip("/"))
+                relative_path_structure(item.name.rstrip("/"))
                 continue
-            name = relative_file(item.name)
+            name = relative_path_structure(item.name)
             total += item.size
             if not item.isfile() or name in files or total > MAX_SOURCE_BYTES or len(files) >= MAX_FILES:
                 raise ValueError("Source archive exceeds bounds or contains unsafe members")
@@ -173,7 +181,7 @@ def frozen_source(task):
     raw = subprocess.check_output(["git", "archive", "--format=tar", commit], cwd=repository, timeout=60)
     if len(raw) > MAX_SOURCE_BYTES + 16 * 1024 * 1024:
         raise ValueError("Source archive exceeds bounds")
-    files = safe_archive_files(raw)
+    files = {relative_file(name): data for name, data in safe_archive_files(raw).items()}
     with tarfile.open(fileobj=io.BytesIO(raw)) as archive:
         modes = {m.name: 0o755 if m.mode & 0o111 else 0o644 for m in archive if m.isfile()}
     return files, {"kind": "git", "commit": commit, "files": {p: digest(b) for p, b in files.items()}, "modes": modes}

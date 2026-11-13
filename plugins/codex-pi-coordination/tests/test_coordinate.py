@@ -461,6 +461,16 @@ class ContractTests(unittest.TestCase):
         with mock.patch.object(coordinate, "MAX_SOURCE_BYTES", 1), self.assertRaises(ValueError):
             coordinate.safe_archive_files(make_archive([("a", b"xx", tarfile.REGTYPE)]))
 
+    def test_archive_transport_prefix_does_not_consume_native_path_budget(self):
+        for name in [("a" * 200 + "/") * 5 + "b" * 19, ("\U0001f600" * 50 + "/") * 10 + "b" * 14]:
+            self.assertEqual(len(name.encode("utf-16-le")) // 2, 1024)
+            self.assertEqual(coordinate.relative_file(name), name)
+            prefixed = "workspace/" + name
+            self.assertEqual(coordinate.safe_archive_files(make_archive([(prefixed, b"read-only", tarfile.REGTYPE)])), {prefixed: b"read-only"})
+        for name in ["workspace/../escape", "workspace//file", "workspace/.git/config", "workspace/./file", "workspace\\file"]:
+            with self.assertRaises(ValueError):
+                coordinate.safe_archive_files(make_archive([(name, b"bad", tarfile.REGTYPE)]))
+
     def test_frozen_git_export_preserves_dirty_checkout_and_executable_mode(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1370,6 +1380,35 @@ class RecoveryTests(unittest.TestCase):
                 self.assertEqual(self.instances[-1].calls, ["start", "download", "stop"])
                 self.assertEqual(preserved, {path: path.read_bytes() for path in preserved})
 
+    def test_archive_transport_long_readonly_paths_recover_v1_v2(self):
+        paths = [("a" * 200 + "/") * 5 + "b" * 19, ("\U0001f600" * 50 + "/") * 10 + "b" * 14]
+        for version in (1, 2):
+            with self.subTest(version=version):
+                run_id = format(version, "032x")
+                remote = Path(self.profile["remote_parent"]) / run_id
+                results = remote / "results"; results.mkdir(parents=True)
+                files = {name: b"read-only source" for name in paths}
+                source = {"kind": "git", "commit": "a" * 40, "files": {name: coordinate.digest(raw) for name, raw in files.items()}, "modes": {name: 0o644 for name in paths}}
+                native = {"version": version, "run_id": run_id, "task_id": "retained-task", "kind": "validation", "instructions": "Retained source-only task", "workspace": str(remote / "workspace"), "output_directory": str(results), "writable_paths": [], "allowed_tools": sorted(coordinate.TOOLS - {"write", "edit"}), "max_tool_calls": 10, "max_turns": 10, "source": source, "checks": []}
+                if version == 2:
+                    native.update(operation="run", run_options={}, runtime_defaults={"model": "example/model", "thinking": "high"})
+                launch = {"model": "example/model", "thinking": "high", "checks": []}
+                payload = {"task.json": json.dumps(native).encode(), "launch.json": json.dumps(launch).encode(), "coordinate.py": b"# retained worker", "extension.js": b"// retained extension", "package.json": b'{"type":"module"}', **{"workspace/" + name: raw for name, raw in files.items()}}
+                archive = make_archive([(name, raw, tarfile.REGTYPE) for name, raw in payload.items()])
+                failed = self.root / f"long-{version}"; failed.mkdir(); (failed / "inputs.tar").write_bytes(archive)
+                stopped = {"id": "sandbox-id", "name": "disposable", "phase": "Stopped", "main_process_instance_id": "prior-main", "restart_count": 0}
+                original = {"version": version, "run_id": run_id, "task_id": "retained-task", "kind": "validation", "started_at": "2000-01-01T00:00:00Z", "source": source, "input_sha256": coordinate.digest(archive), "remote_artifacts": str(results), "delivery_valid": False, "cleanup_complete": True, "sandbox_running": {**stopped, "phase": "Ready"}, "sandbox_after": stopped}
+                dump(failed / "started.json", original); dump(failed / "receipt.json", original)
+                dump(results / "worker-receipt.json", {"version": version, "run_id": run_id, "task_id": "retained-task", "outcome": "incomplete", "pi_exit_code": 7})
+                locks = self.root / "locks"; locks.mkdir(exist_ok=True); dump(locks / (coordinate.digest(b"sandbox-id") + ".json"), original)
+                preserved = coordinate.snapshot(failed)
+                with mock.patch.object(coordinate, "OpenShellOwner", self.recovery_factory()), mock.patch.object(coordinate, "execute_to_log", side_effect=AssertionError("No Pi or checks during recovery")), contextlib.redirect_stdout(io.StringIO()):
+                    output = self.root / f"recovered-{version}"
+                    self.assertEqual(coordinate.main(["recover", str(failed), "--profile", str(self.profile_path), "--output", str(output), "--lock-root", str(locks)]), 0)
+                self.assertTrue(coordinate.read_json(output / "receipt.json")["recovery_valid"])
+                self.assertEqual(self.instances[-1].calls, ["start", "download", "stop"])
+                self.assertEqual(coordinate.snapshot(failed), preserved)
+
     def test_nonzero_check_recovers_without_reexecution_or_task_success(self):
         original = self.failed_run()
         before = {name: (self.root / 'out' / name).read_bytes() for name in ['receipt.json', 'inputs.tar', 'started.json']}
@@ -1739,6 +1778,35 @@ class SavedConversationTests(unittest.TestCase):
         first = coordinate.run_task(self.task_path, self.profile_path, self.root / "first", self.root / "locks", save_session=True)
         remote = Path(first["remote_artifacts"]).parent
         return first, remote, coordinate.read_json(remote / "task.json")
+
+    def test_archive_transport_long_readonly_source_round_trips_continue(self):
+        paths = [("a" * 200 + "/") * 5 + "b" * 19, ("\U0001f600" * 50 + "/") * 10 + "b" * 14]
+        for name in paths:
+            path = self.repository / name; path.parent.mkdir(parents=True); path.write_bytes(b"read-only source")
+        self.commit()
+        first, _remote, native = self.first_saved()
+        self.assertTrue(first["delivery_valid"], first)
+        self.assertFalse(set(paths) & set(native["writable_paths"]))
+        (self.repository / "answer.txt").write_text("first edit\n"); self.commit(); self.assignment("second edit")
+        second = coordinate.run_task(self.task_path, self.profile_path, self.root / "second", self.root / "locks", previous_directory=self.root / "first")
+        self.assertTrue(second["delivery_valid"], second)
+        for name in paths:
+            self.assertEqual((Path(native["workspace"]) / name).read_bytes(), b"read-only source")
+
+    def test_archive_source_1025_units_refuses_before_owner_for_both_public_versions(self):
+        for index, name in enumerate([("a" * 200 + "/") * 5 + "b" * 20, ("\U0001f600" * 50 + "/") * 10 + "b" * 15]):
+            path = self.repository / name; path.parent.mkdir(parents=True); path.write_bytes(b"overlong")
+            self.commit()
+            for version in (1, 2):
+                task = self.assignment("no execution"); task["version"] = version
+                if version == 1:
+                    task.pop("run_options"); task["task_id"] = "legacy-task"
+                dump(self.task_path, task)
+                output = self.root / f"overlong-{index}-{version}"
+                with mock.patch.object(coordinate, "OpenShellOwner") as owner, self.assertRaisesRegex(ValueError, "native bounds"):
+                    coordinate.run_task(self.task_path, self.profile_path, output, self.root / "locks", save_session=True)
+                owner.assert_not_called(); self.assertFalse(output.exists())
+            path.unlink(); self.commit()
 
     def test_failed_checks_recover_advanced_conversation_without_replay(self):
         failed, remote, native = self.first_saved(checks=[{"name": "failing", "argv": [sys.executable, "-c", "raise SystemExit(7)"], "timeout_seconds": 5}])
