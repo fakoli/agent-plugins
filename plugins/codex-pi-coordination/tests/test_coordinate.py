@@ -1410,6 +1410,8 @@ class RecoveryTests(unittest.TestCase):
         self.run_fake()
         with self.assertRaisesRegex(ValueError, 'unsuccessful'):
             coordinate.recover_task(self.root / 'out', self.profile_path, self.root / 'recovered', self.root / 'locks')
+        with self.assertRaisesRegex(ValueError, 'unsuccessful'):
+            coordinate.recover_task(self.root / 'out', self.profile_path, self.root / 'inspected', self.root / 'locks', reconcile_conversation=True)
         self.assertEqual(len(self.instances), 1)
 
     def test_recovery_retry_keeps_original_identity_after_reconcile(self):
@@ -1707,6 +1709,30 @@ class SavedConversationTests(unittest.TestCase):
         self.assertFalse((stale_remote / "invocations.txt").exists())
         self.assertIn("Stale or duplicate", coordinate.read_json(stale_remote / "results/worker-receipt.json")["error"])
         self.assertEqual(coordinate.snapshot(self.root / "first"), before_artifacts)
+        # The successful checkpoint can be inspected after a newer refused
+        # dispatch changed the owner journal, without reexecuting either task.
+        second_artifacts = coordinate.snapshot(self.root / "second")
+        terminal_session = session_path.read_bytes()
+        terminal_workspace = coordinate.workspace_manifest(Path(second_checkpoint["session"]["cwd"]))
+        count = len(self.instances)
+        with self.assertRaisesRegex(ValueError, "unsuccessful delivery"):
+            coordinate.recover_task(self.root / "second", self.profile_path, self.root / "invalid-recovery", self.root / "locks")
+        self.assertEqual(len(self.instances), count)
+        self.assertEqual(coordinate.main(["reconcile", "--from", str(self.root / "second"), "--output", str(self.root / "inspected"), "--profile", str(self.profile_path), "--lock-root", str(self.root / "locks")]), 0)
+        inspection_receipt = coordinate.read_json(self.root / "inspected/receipt.json")
+        inspection = coordinate.read_json(self.root / "inspected/conversation-inspection.json")
+        self.assertTrue(inspection_receipt["recovery_valid"], inspection_receipt)
+        self.assertTrue(inspection_receipt["conversation_valid"], inspection_receipt)
+        self.assertFalse(inspection_receipt["delivery_valid"])
+        self.assertEqual(inspection["disposition"], "terminal_checkpoint")
+        self.assertEqual(inspection["checkpoint"], second_checkpoint)
+        self.assertEqual(session_path.read_bytes(), terminal_session)
+        self.assertEqual(coordinate.workspace_manifest(Path(second_checkpoint["session"]["cwd"])), terminal_workspace)
+        self.assertEqual(coordinate.snapshot(self.root / "second"), second_artifacts)
+        self.assertEqual(len(self.instances), count + 1)
+        self.assertEqual(self.instances[-1].calls, ["start", "download", "exec", "stop"])
+        self.assertEqual((Path(second["remote_artifacts"]).parent / "invocations.txt").read_text(), "1")
+        self.assertFalse((stale_remote / "invocations.txt").exists())
 
     def first_saved(self, *, checks=None):
         self.assignment("first edit", checks=checks)

@@ -172,6 +172,10 @@ archiving that intent without changing workspace bytes. A fully switched new
 tree without verified terminal evidence stays noncontinuable; mixed, missing or
 foreign state stays held. There is no rollback or automatic restore. Inspect
 `conversation_valid` separately from `recovery_valid` and CLI exit status.
+The same `reconcile --from` form also inspects a successful saved run after
+intervening metadata or a refused stale continuation. It verifies the terminal
+checkpoint without Pi, checks or a workspace switch. `recover` still accepts
+only failed runs; a successful inspection does not grant another delivery.
 
 Require confirmed managed stop and unchanged protected resources. An exec
 timeout does not prove remote termination. Unknown custody blocks another run.

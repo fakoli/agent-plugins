@@ -1714,7 +1714,7 @@ def verify_recovered_artifacts(results, task, source_files):
 
 def recover_task(failed_directory, profile_file, output, lock_root, *, reconcile_conversation=False):
     profile = profile_settings(profile_file)
-    original, task, source_files, original_hashes = recovery_inputs(failed_directory, profile)
+    original, task, source_files, original_hashes = recovery_inputs(failed_directory, profile, allow_saved_success=reconcile_conversation)
     output = Path(output).absolute()
     output.mkdir(parents=True, exist_ok=False)
     owner = OpenShellOwner(profile)

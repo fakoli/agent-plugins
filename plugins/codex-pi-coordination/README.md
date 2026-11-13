@@ -110,7 +110,10 @@ Use `reconcile --from FAILED_RUN --output NEW_DIRECTORY` for a saved workspace
 transition. It can certify the exact unchanged prior tree and archive its
 matching pending intent. A switched-new tree without verified terminal model
 evidence remains unavailable for continuation; mixed or unknown state stays
-held. It never restores files, rolls back a workspace, rewrites history or
+held. The same command can inspect a successful saved run after an intervening
+metadata or refused stale dispatch: it returns a fresh terminal checkpoint
+readback without Pi or checks. `recover` remains failed-run-only, and inspection
+still reports `delivery_valid: false`. It never restores files, rolls back a workspace, rewrites history or
 replays a prompt. The existing no-argument `reconcile` only records independently
 confirmed stopped owner custody.
 

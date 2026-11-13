@@ -364,6 +364,17 @@ The existing no-argument `reconcile` remains a stopped-owner custody readback,
 not conversation certification. Preserve all previous journal and dispatch
 artifacts; neither path rolls back files, prunes evidence or reruns a prompt.
 
+`reconcile --from SUCCESSFUL_SAVED_RUN --output NEW_DIRECTORY` additionally
+admits a successful native version-3 saved return for terminal inspection.
+After an intervening metadata run or refused stale continuation, it verifies
+the exact successful session, workspace and checkpoint and returns
+`disposition: terminal_checkpoint`. No pending transition is permitted in this
+case, and no Pi process, check, source switch or checkpoint advance occurs.
+The separate inspection receipt keeps `delivery_valid: false` and
+`acceptance: not_granted`; the original successful receipt stays immutable.
+Ordinary `recover` remains failed-delivery-only, and successful ephemeral runs
+cannot use this saved-conversation inspection variant.
+
 Synthetic process/file fixtures, installed command discovery, actual default
 OpenShell two-edit/same-session qualification and selected-model metadata are
 separate checks. The actual installed journeys remain delivery gates. Anvil
