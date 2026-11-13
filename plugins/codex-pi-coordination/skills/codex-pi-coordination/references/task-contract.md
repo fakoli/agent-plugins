@@ -28,7 +28,10 @@ dependencies; the extension has no npm dependencies. Examples below are syntheti
 Required: version, task_id, kind, instructions, writable_paths and checks.
 Repository/revision are optional together. Kinds: implementation, research,
 review, validation. Writable paths are exact relative files, not globs or
-directories. Research may return `findings.md`; read-only review/validation may
+directories. Each relative path is limited to 1,024 UTF-16 code units in both
+Python and the extension. Malformed Unicode, Unicode spaces that would be
+normalized, traversal and noncanonical spellings refuse before owner work;
+paths are never silently rewritten. Research may return `findings.md`; read-only review/validation may
 use no writable files and report findings through the handoff tool. Commands
 are coordinator-authored argv, executed once after Pi exits; they share the
 overall deadline and retain actual logs and exit status.
@@ -52,12 +55,15 @@ selected runtime/model advertises it.
 Version-2 task IDs match `[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}`. Version-1 user
 inputs keep their original fields and 80-character ID pattern
 `[A-Za-z0-9][A-Za-z0-9_.-]{0,79}`; they cannot contain `run_options`. New runs
-normalize either input version into the current native contract. Historical
-version-1 return/recovery artifacts keep their original interpretation.
+normalize either input version into native version 2 for ephemeral work.
+Saved Run/Continue and selected-model metadata use explicit native version-3
+variants; users still submit public version-1/2 tasks. Historical version-1/2
+return/recovery artifacts keep their original interpretation.
 
 Public assignments never supply `run_id`. Native artifacts carry a separate
 coordinator-generated run identity; the extension preserves its historical
-128-character pattern `[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}` in both versions.
+128-character pattern `[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}`; saved descriptors further
+require the generated 32-character hexadecimal dispatch identity.
 The version-1 task-ID limit does not apply to that native field. Both ID fields
 must match their entire pattern, without trailing newlines.
 
@@ -117,14 +123,19 @@ the runner skips artifact download. `receipt.json` retains `remote_artifacts`
 for the supported `recover` command after stopped custody is confirmed.
 Do not collect remote artifacts while failed work may still be active. The
 runtime owner handles retention. Remote runs remain for diagnosis;
-preparation refuses when retained run data reaches 1 GiB.
+preparation enforces a 1 GiB retained-material bound; saved workers also observe
+it during Pi and trusted-check execution and before sealing a checkpoint.
+Saved session files are limited to 16 MiB and checkpoint/control JSON to 1 MiB.
+Overflow refuses delivery/continuation without truncating or pruning prior data.
+The remote bound includes retained source, dispatch and conversation material;
+it is an observed limit, not a hard filesystem quota or hostile-process guarantee.
 
 ## Native RPC execution and capabilities
 
-Every new run starts an ephemeral `--no-session` native RPC child in the owned
-OpenShell worker, with only the explicit coordination extension and scoped tools.
-Saved-session continuation is future work (P1b); fresh runs do not resume an
-interactive process or official conversation file.
+An ordinary `run TASK --output NEW_DIRECTORY` starts an ephemeral `--no-session`
+native RPC child in the owned OpenShell worker, with only the explicit
+coordination extension and scoped tools. Saved Run and Continue use the official
+session path described below; neither attaches to an interactive process.
 
 Before the single task prompt, the runner queries available models, selects an
 exact provider/model, queries `get_available_thinking_levels`, validates and
@@ -166,7 +177,80 @@ setters and does not require profile defaults to be supported by the current mod
 Task runs still require exact supported options before their one prompt. Its CLI reports
 `capabilities_valid`; the receipt retains `delivery_valid: false` and
 `acceptance: not_granted`. Metadata discovery is separate from actual setup,
-model execution and real-edit qualification.
+model execution and real-edit qualification. Default Run does not require a
+capability query.
+
+For selected-model metadata, supply an exact pair:
+
+```sh
+python3 ../../scripts/coordinate.py capabilities --provider configured-provider --model exact-model-id --output /private/evidence/selected-capabilities
+```
+
+Missing, malformed, unavailable or duplicate selector matches refuse. Native
+version 3 uses `operation: capabilities_selected`, separate from execution
+options. It starts an ephemeral no-session child without tools or extensions,
+queries initial state/catalog, sends official non-persistent `set_model` only
+if needed, then obtains that model's thinking levels and exact idle readback.
+It permits the narrowly correlated model-induced thinking event, but sends no
+`set_thinking_level` and no prompt. Evidence retains the selected identity,
+observed current thinking/levels and profile-default compatibility. Unsupported
+profile thinking does not block this metadata query; ordinary Run/Continue
+still refuse that default unless the task explicitly selects a supported level.
+Observed metadata is not execution approval, a fallback choice or an invented
+`auto`/`dynamic` capability. Existing no-option metadata remains native version 2
+and sends no setters.
+
+## Official saved Run and Continue
+
+```sh
+python3 ../../scripts/coordinate.py run first-task.json --save-session --output /private/evidence/first-run
+python3 ../../scripts/coordinate.py continue next-task.json --from /private/evidence/first-run --output /private/evidence/next-run
+```
+
+Before Continue, inspect and integrate the first approved return through the
+repository workflow, commit it, and set the new task's explicit repository and
+revision. Saved dispatches require committed Git source. The public task does
+not carry a session path or executable. The host derives a native version-3
+`run` or `continue` variant with an owned conversation ID, stable workspace,
+exact session file and prior checkpoint digest/run identity. Each dispatch has
+new task/source hashes and separate controls/results. Anvil's outer request
+must bind its current task, actor, claim and generation separately.
+
+The first saved run exclusively creates its conversation and requires the
+session path to be absent. Pi receives exact absolute `--session FILE` and
+matching `--session-dir DIRECTORY`, without `--no-session`. Continue requires
+a bounded nonempty regular file containing complete JSONL, a current version-3
+header, full official ID, the stable cwd and persisted assistant history.
+Missing/empty/header-only, malformed, partial, foreign, symlinked, migrated or
+drifted history refuses before Pi starts. RPC and extension readbacks must match
+the actual session ID/file/cwd. There is no latest-session lookup, partial-ID
+match, `--continue`/`--resume` shortcut, fork, header rewrite or cwd shim.
+
+Before switching source, verify the complete old workspace bytes and all file
+and directory modes against its terminal checkpoint, including check-created
+files. Stage the new committed source separately with exact modes. Write an
+intent naming old/staged/new manifests before any rename; preserve the old
+workspace under its dispatch identity and move the staged source to the same
+stable cwd. Duplicate/stale `--from` or a pending/mixed transition refuses.
+No automatic rollback, deletion or reset resolves uncertain outcomes.
+
+A fresh Pi process loads only the current task and coordination extension.
+Session-start/before-agent-start evidence binds official session ID, stable cwd,
+dispatch and task hash; counters and handoff state restart for this dispatch.
+The complete current assignment, source, writable scope, checks, options and
+limits supply authority. Historical conversation content grants none of them.
+Exact supported options and idle, noncompacting, empty-queue session state are
+required before the single prompt; uncertain acknowledgement is never replayed.
+
+After settled handoff, idle readback, orderly exit and extension shutdown, run
+the fresh checks and record terminal session/workspace bindings. Saved receipts
+include before/after session byte lengths and hashes, unchanged header identity,
+the prior-prefix hash, prior/current dispatch/task hashes, source revision and
+the complete final workspace manifest. The checkpoint advances only with those
+bindings. The returned source-change manifest remains separate and does not
+turn check-created files into approved source changes. The saved conversation
+file stays in owned remote storage; current dispatch events and model output
+remain private evidence and must not be published.
 
 ## Return and trust
 
@@ -181,13 +265,14 @@ New return evidence includes `rpc-events.jsonl` (sanitized control transcript),
 `rpc-configuration.json`. Check logs retain `<check-name>.log`, including the
 valid name `pi-stderr`; started/result receipts and hash checks remain unchanged.
 The worker receipt's `configuration` binds requested options, profile defaults,
-effective options, supported levels, ephemeral session ID, prompt admission,
+effective options, supported levels, actual session ID/file variant, prompt admission,
 settlement, shutdown and RPC/stderr hashes. Input/task/source hashes bind this
-evidence to the assignment. The version-2 extension's `run_configuration` event
+evidence to the assignment. The extension's `run_configuration` event
 at the first `before_agent_start` records actual provider/model from its context
 and thinking from `pi.getThinkingLevel()`. `task_loaded.model` records startup
 state and does not prove the later RPC selection. Normal verification and
-recovery decode v1/v2 explicitly; old evidence cannot acquire these new claims.
+recovery decode native versions 1/2/3 explicitly; old evidence cannot acquire
+new saved-session claims.
 
 `model-report.json` is Pi's task-bound self-report. `extension-events.jsonl`
 records task loading, budget/tool observations and lifecycle events. These are
@@ -220,15 +305,20 @@ remain the process boundary.
 uses the normal `--profile` and `--lock-root` options. Keep the failed directory's
 `started.json`, `receipt.json` and `inputs.tar` unchanged. Recovery validates their
 hashes, safe archive members, task/source bindings and derived remote results
-path before any lifecycle action. The latest owner journal must bind that failed
-run and input with completed Stopped custody; a newer assignment, active owner,
-identity drift or competing lock refuses. A worker that returned work but failed
+path before any lifecycle action. For legacy ephemeral recovery, the latest
+owner journal must bind that failed run and input with completed Stopped custody;
+a newer assignment refuses. Saved recovery instead binds its independent
+conversation checkpoint to fresh resolved Stopped custody, so an intervening
+metadata or ephemeral run does not invalidate it. Active owners, identity drift
+or competing locks refuse. A worker that returned work but failed
 cleanup may be recovered after reconciliation; an already-valid delivery may not.
 
 The owner must qualify the existing sandbox entrypoint as idle on restart. The
 runner starts a fresh Ready main instance and performs only a native download,
-then verifies its identity, stops it and reads back protected resources. It does
-not upload, exec, rerun Pi or rerun checks. For both normal runs and recovery, if a start fails before the fresh
+then verifies its identity, stops it and reads back protected resources.
+Legacy recovery does not exec a worker. Saved recovery may run the retained,
+hash-bound conversation inspector to read checkpoint/session/workspace state;
+it never launches Pi or reruns task checks. For both normal runs and recovery, if a start fails before the fresh
 instance is bound, an unexpected main is not stopped; custody remains unresolved.
 Unknown cleanup blocks another run until supported Stopped reconciliation. A
 retry retains the original failed-run identity even after recovery reconciliation.
@@ -249,3 +339,34 @@ These checks occur after native download. The download timeout is not a hard
 pre-download byte or storage quota, and same-user hashes are not an independent
 issuer attestation. This is recovery from an exclusively owned trusted runtime,
 not arbitrary historical sandbox browsing or hostile-output containment.
+
+
+For a failed saved dispatch, `conversation_valid` is a separate recovery field.
+A failed trusted check can leave a verified advanced session/checkpoint while
+`delivery_valid` and `task_delivery_valid` stay false. Only explicit successful
+recovery with `conversation_valid: true` supplies a continuation checkpoint;
+use that recovery output as `--from` with a newly approved task. Partial session
+tails, missing acknowledgement, incomplete shutdown or ambiguous checkpoint
+bindings leave continuation unavailable. An earlier valid conversation does not
+justify replaying an uncertain task prompt.
+
+```sh
+python3 ../../scripts/coordinate.py reconcile --from /private/evidence/failed-run --output /private/evidence/reconciliation
+```
+
+This saved-conversation variant requires both `--from` and a new `--output`.
+After exact stopped custody, it inspects the retained transition intent and
+session/checkpoint binding. An unchanged old tree with the exact staged source
+can be certified by archiving its pending intent; workspace/session bytes are
+not restored or rewritten. A completed-new tree without verified terminal
+model evidence remains noncontinuable. Mixed, missing or foreign state refuses.
+The existing no-argument `reconcile` remains a stopped-owner custody readback,
+not conversation certification. Preserve all previous journal and dispatch
+artifacts; neither path rolls back files, prunes evidence or reruns a prompt.
+
+Synthetic process/file fixtures, installed command discovery, actual default
+OpenShell two-edit/same-session qualification and selected-model metadata are
+separate checks. The actual installed journeys remain delivery gates. Anvil
+must separately validate CLI/web admission, fresh claim bindings, integration,
+native checkout proofs, `needs_review` and approval. Plugin sandbox checks and
+conversation validity confer no native acceptance, latency or fleet-scale claim.

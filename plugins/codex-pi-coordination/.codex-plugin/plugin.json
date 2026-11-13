@@ -1,15 +1,15 @@
 {
   "name": "codex-pi-coordination",
-  "version": "0.2.0",
-  "description": "Coordinate bounded implementation, research, review and validation tasks between Codex and Pi inside NVIDIA OpenShell.",
+  "version": "0.3.0",
+  "description": "Coordinate bounded tasks, saved Pi conversations and model capability discovery inside NVIDIA OpenShell.",
   "author": {
     "name": "Fakoli",
     "url": "https://github.com/fakoli"
   },
   "interface": {
     "displayName": "Codex Pi Coordination",
-    "shortDescription": "Delegate scoped work to Pi and verify its return.",
-    "longDescription": "Codex owns task scope and acceptance. Pi works in a disposable OpenShell workspace and returns bounded artifacts, while a stdlib runner records actual command results and managed cleanup.",
+    "shortDescription": "Run scoped Pi tasks and continue saved work.",
+    "longDescription": "Codex owns scope, integration and acceptance. Pi executes fresh assignments in an owned OpenShell sandbox, optionally continuing a verified saved conversation. The runner retains bounded artifacts, actual checks and managed cleanup.",
     "developerName": "Fakoli",
     "category": "Productivity",
     "capabilities": [

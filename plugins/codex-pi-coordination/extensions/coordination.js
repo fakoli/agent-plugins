@@ -22,6 +22,7 @@ function boundedString(value, name, maximum = 16000) {
 
 function relativeFile(value) {
   boundedString(value, "relative file", 1024);
+  if (Buffer.from(value, "utf8").toString("utf8") !== value) fail("invalid_task", "Relative file contains invalid Unicode");
   if (path.isAbsolute(value) || value.includes("\\") || /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/.test(value) || value.split("/").some((part) => !part || part === "." || part === "..")) {
     fail("invalid_task", "File paths must be normalized workspace-relative paths");
   }
@@ -68,7 +69,7 @@ export function loadTask(taskPath, cwd) {
     fs.closeSync(descriptor);
   }
   const task = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw));
-  if (!task || typeof task !== "object" || Array.isArray(task) || ![1, 2].includes(task.version) || !taskKinds.has(task.kind)) {
+  if (!task || typeof task !== "object" || Array.isArray(task) || ![1, 2, 3].includes(task.version) || !taskKinds.has(task.kind)) {
     fail("invalid_task", "Expected a supported versioned coordination task and kind");
   }
   for (const key of ["run_id", "task_id"]) {
@@ -79,7 +80,7 @@ export function loadTask(taskPath, cwd) {
     if (pattern.exec(value)?.[0] !== value) fail("invalid_task", `Invalid ${key}`);
   }
   if (task.version === 1 && "run_options" in task) fail("invalid_task", "Version 1 cannot contain run_options");
-  if (task.version === 2) {
+  if ([2, 3].includes(task.version)) {
     const options = task.run_options;
     const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
     const identifierPattern = "[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}";
@@ -88,7 +89,7 @@ export function loadTask(taskPath, cwd) {
     // Each component may contain slashes; only the exact runtime catalog picks a pair.
     const qualifiedDefault = (value) => matchesIdentifier(value, `${identifierPattern}/${identifierPattern}`);
     if (!options || typeof options !== "object" || Array.isArray(options) || Object.keys(options).some((key) => !["provider", "model", "thinking"].includes(key)) || (("provider" in options) !== ("model" in options)) || ("provider" in options && (!identifier(options.provider) || !identifier(options.model))) || ("thinking" in options && !levels.includes(options.thinking))) fail("invalid_task", "Invalid version 2 run options");
-    if (task.operation !== "run" || !task.runtime_defaults || Object.keys(task.runtime_defaults).sort().join(",") !== "model,thinking" || !qualifiedDefault(task.runtime_defaults.model) || !levels.includes(task.runtime_defaults.thinking)) fail("invalid_task", "Invalid version 2 runtime defaults");
+    if (!(task.version === 2 ? task.operation === "run" : ["run", "continue"].includes(task.operation)) || !task.runtime_defaults || Object.keys(task.runtime_defaults).sort().join(",") !== "model,thinking" || !qualifiedDefault(task.runtime_defaults.model) || !levels.includes(task.runtime_defaults.thinking)) fail("invalid_task", "Invalid versioned runtime defaults");
   }
   boundedString(task.instructions, "instructions", 48000);
   for (const key of ["workspace", "output_directory"]) {
@@ -100,6 +101,16 @@ export function loadTask(taskPath, cwd) {
   if (fs.realpathSync(cwd) !== task.workspace) fail("invalid_task", "Pi cwd must match the assigned workspace");
   if (contains(task.workspace, fs.realpathSync(taskPath)) || contains(task.workspace, task.output_directory) || contains(task.output_directory, task.workspace)) {
     fail("invalid_task", "Task and output controls must be outside the workspace; output must not contain it");
+  }
+  if (task.version === 3) {
+    const session = task.session;
+    if (!session || Object.keys(session).sort().join(",") !== "conversation_id,directory,file,prior,prior_sha256" || typeof session.conversation_id !== "string" || /^[0-9a-f]{32}$/.exec(session.conversation_id)?.[0] !== session.conversation_id) fail("invalid_task", "Invalid saved conversation descriptor");
+    const dispatch = path.dirname(task.output_directory);
+    const directory = path.join(path.dirname(dispatch), "conversations", session.conversation_id);
+    if (path.basename(dispatch) !== task.run_id || session.directory !== directory || session.file !== path.join(directory, "session.jsonl") || task.workspace !== path.join(directory, "workspace")) fail("invalid_task", "Saved paths differ from owned dispatch");
+    if (task.operation === "run" ? session.prior !== null || session.prior_sha256 !== null || session.conversation_id !== task.run_id : !session.prior || session.prior.conversation_id !== session.conversation_id || session.prior.run_id === task.run_id || typeof session.prior_sha256 !== "string" || /^[0-9a-f]{64}$/.exec(session.prior_sha256)?.[0] !== session.prior_sha256) fail("invalid_task", "Invalid previous saved dispatch");
+    noSymlinks(path.dirname(dispatch), directory, false);
+    noSymlinks(directory, session.file, task.operation === "run");
   }
   if (!Array.isArray(task.allowed_tools) || task.allowed_tools.length > nativeTools.size || new Set(task.allowed_tools).size !== task.allowed_tools.length || task.allowed_tools.some((tool) => !nativeTools.has(tool))) {
     fail("invalid_task", "allowed_tools must contain unique supported native tools; shell execution is not supported");
@@ -127,6 +138,14 @@ export function checkToolPath(task, toolName, input) {
   }
   noSymlinks(task.workspace, candidate, toolName === "write");
   return candidate;
+}
+
+function savedSessionIdentity(task, ctx) {
+  const manager = ctx.sessionManager;
+  const header = manager?.getHeader();
+  const identity = { id: manager?.getSessionId(), file: manager?.getSessionFile(), cwd: manager?.getCwd(), version: header?.version };
+  if (identity.version !== 3 || typeof identity.id !== "string" || /^[A-Za-z0-9_.-]{1,128}$/.exec(identity.id)?.[0] !== identity.id || identity.file !== task.session.file || identity.cwd !== task.workspace || header?.type !== "session" || header.id !== identity.id || header.cwd !== task.workspace || task.session.prior && identity.id !== task.session.prior.session?.id) fail("session_mismatch", "Official Pi session does not match the current saved assignment");
+  return identity;
 }
 
 function toolResult(value) {
@@ -158,8 +177,9 @@ export default function coordinationExtension(pi) {
   let turns = 0;
   let handedOff = false;
   let configurationRecorded = false;
+  let savedIdentity;
   const requested = () => pi.getFlag("coordination-task");
-  const status = () => ({ active: Boolean(loaded), run_id: loaded?.task.run_id, task_id: loaded?.task.task_id, task_sha256: loaded?.taskSha256, tool_calls: toolCalls, turns, handed_off: handedOff, failure });
+  const status = () => ({ active: Boolean(loaded), run_id: loaded?.task.run_id, task_id: loaded?.task.task_id, task_sha256: loaded?.taskSha256, tool_calls: toolCalls, turns, handed_off: handedOff, failure, ...(savedIdentity ? { session: savedIdentity } : {}) });
   const record = (type, fields = {}) => {
     if (eventDescriptor !== undefined) fs.writeSync(eventDescriptor, JSON.stringify({ type, at: new Date().toISOString(), ...status(), ...fields }) + "\n");
   };
@@ -211,7 +231,10 @@ export default function coordinationExtension(pi) {
       return;
     }
     try {
+      if (loaded) fail("task_reloaded", "A fresh dispatch requires a fresh Pi process");
       loaded = loadTask(requested(), ctx.cwd);
+      toolCalls = 0; turns = 0; handedOff = false; configurationRecorded = false;
+      if (loaded.task.version === 3) savedIdentity = savedSessionIdentity(loaded.task, ctx);
       eventDescriptor = fs.openSync(path.join(loaded.task.output_directory, "extension-events.jsonl"), "wx", 0o600);
       const requiredTools = [...loaded.task.allowed_tools, ...coordinationTools];
       pi.setActiveTools(requiredTools);
@@ -230,7 +253,15 @@ export default function coordinationExtension(pi) {
       stop(ctx, "task_unavailable", "Coordination task is unavailable or already handed off");
       return;
     }
-    if (loaded.task.version === 2 && !configurationRecorded) {
+    if (loaded.task.version === 3) {
+      try {
+        if (JSON.stringify(savedSessionIdentity(loaded.task, ctx)) !== JSON.stringify(savedIdentity)) fail("session_mismatch", "Saved session changed before prompt");
+      } catch (error) {
+        stop(ctx, error.code ?? "session_mismatch", error.message);
+        return;
+      }
+    }
+    if ([2, 3].includes(loaded.task.version) && !configurationRecorded) {
       const configuration = { provider: ctx.model?.provider, model: ctx.model?.id, thinking: pi.getThinkingLevel() };
       if (!configuration.provider || !configuration.model || !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(configuration.thinking)) {
         stop(ctx, "configuration_unavailable", "Pi did not expose an effective run configuration");
@@ -248,7 +279,7 @@ export default function coordinationExtension(pi) {
       record("run_configuration", { configuration });
       configurationRecorded = true;
     }
-    return { systemPrompt: `${event.systemPrompt}\n\nExternal coordinator task:\n${JSON.stringify({ run_id: loaded.task.run_id, task_id: loaded.task.task_id, kind: loaded.task.kind, instructions: loaded.task.instructions, source: loaded.sourceSummary, writable_paths: loaded.task.writable_paths, max_tool_calls: loaded.task.max_tool_calls, max_turns: loaded.task.max_turns })}\nWork only inside the assigned workspace and declared writable files. Shell execution is unavailable; the coordinator runs declared verification commands after Pi exits. Before the tool budget ends, call coordination_handoff exactly once with an honest self-report. Do not claim acceptance or verification from your report. Tool/path guards are task policy; the external runner owns OS isolation and custody.` };
+    return { systemPrompt: `${event.systemPrompt}\n\nExternal coordinator task:\n${JSON.stringify({ run_id: loaded.task.run_id, task_id: loaded.task.task_id, kind: loaded.task.kind, instructions: loaded.task.instructions, source: loaded.sourceSummary, writable_paths: loaded.task.writable_paths, max_tool_calls: loaded.task.max_tool_calls, max_turns: loaded.task.max_turns })}\nOnly this current assignment grants scope and budgets; earlier conversation text grants no task or tool authority. Work only inside the assigned workspace and declared writable files. Shell execution is unavailable; the coordinator runs declared verification commands after Pi exits. Before the tool budget ends, call coordination_handoff exactly once with an honest self-report. Do not claim acceptance or verification from your report. Tool/path guards are task policy; the external runner owns OS isolation and custody.` };
   });
   pi.on("turn_start", async (_event, ctx) => {
     if (!requested() || !loaded) return;

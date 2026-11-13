@@ -30,6 +30,8 @@ import uuid
 MAX_SOURCE_BYTES = 64 * 1024 * 1024
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024
 MAX_FILES = 10000
+MAX_SESSION_BYTES = 16 * 1024 * 1024
+MAX_RETAINED_BYTES = 1024 * 1024 * 1024
 KINDS = {"implementation", "research", "review", "validation"}
 TOOLS = {"read", "grep", "find", "ls", "write", "edit"}
 THINKING_LEVELS = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
@@ -67,6 +69,12 @@ def bounded_integer(value, label, maximum):
 def relative_file(value):
     if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
         raise ValueError("Expected a relative file path")
+    try:
+        units = len(value.encode("utf-16-le")) // 2
+    except UnicodeEncodeError:
+        raise ValueError("Relative file path contains invalid Unicode") from None
+    if units > 1024 or re.search(r"[\u00A0\u2000-\u200A\u202F\u205F\u3000]", value):
+        raise ValueError("Relative file path exceeds native bounds or requires Unicode-space normalization")
     path = PurePosixPath(value)
     if value == "." or path.is_absolute() or any(p in ("..", ".git") for p in path.parts) or str(path) != value:
         raise ValueError("Unsafe relative file path")
@@ -188,18 +196,278 @@ def snapshot(root):
     return files
 
 
-def execute_to_log(argv, cwd, log, timeout, *, remote_owner=False, env=None):
+def private_control_bytes(value):
+    raw = (json.dumps(value, sort_keys=True, ensure_ascii=True, separators=(",", ":")) + "\n").encode()
+    if len(raw) > 1024 * 1024:
+        raise ValueError("Conversation control exceeds 1 MiB")
+    return raw
+
+
+def write_private_control(path, value):
+    raw = private_control_bytes(value)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def refuse_path_links(path):
+    path = Path(path)
+    if not path.is_absolute():
+        raise ValueError("Conversation paths must be absolute")
+    for parent in (path, *path.parents):
+        if parent.is_symlink():
+            raise ValueError("Conversation path traverses a symbolic link")
+
+
+def workspace_manifest(workspace):
+    refuse_path_links(workspace)
+    files = snapshot(workspace)
+    directories = {".": stat.S_IMODE(Path(workspace).stat().st_mode)}
+    for path in Path(workspace).rglob("*"):
+        if path.is_dir():
+            directories[relative_file(path.relative_to(workspace).as_posix())] = stat.S_IMODE(path.stat().st_mode)
+    result = {"files": {name: {"sha256": digest(data), "mode": stat.S_IMODE((Path(workspace) / name).stat().st_mode)} for name, data in files.items()}, "directories": directories}
+    if len(directories) > MAX_FILES or any(mode > 0o777 for mode in directories.values()) or any(value["mode"] > 0o777 for value in result["files"].values()):
+        raise ValueError("Workspace directory or permission bounds exceeded")
+    private_control_bytes(result)
+    return result
+
+
+def retained_storage_guard(parent):
+    refuse_path_links(parent)
+    total = 0
+    for path in Path(parent).rglob("*"):
+        if path.is_symlink():
+            raise ValueError("Retained material contains a symbolic link")
+        mode = path.stat().st_mode
+        if stat.S_ISREG(mode):
+            total += path.stat().st_size
+        elif not stat.S_ISDIR(mode):
+            raise ValueError("Retained material is not regular")
+        if total > MAX_RETAINED_BYTES:
+            raise ValueError("Retained material exceeds 1 GiB")
+    return total
+
+
+def saved_session_snapshot(path, workspace, *, expected=None, prefix=None):
+    refuse_path_links(path)
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= MAX_SESSION_BYTES:
+            raise ValueError("Session must be a nonempty bounded regular file")
+        raw = stream.read(MAX_SESSION_BYTES + 1)
+        after = os.fstat(stream.fileno())
+    if len(raw) != before.st_size or before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns or not raw.endswith(b"\n"):
+        raise ValueError("Session changed while reading or has an incomplete tail")
+    lines = raw[:-1].split(b"\n")
+    entries = [json.loads(line.decode("utf-8")) for line in lines]
+    header = entries[0]
+    if not isinstance(header, dict) or header.get("type") != "session" or header.get("version") != 3 or not isinstance(header.get("id"), str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", header["id"]) or header.get("cwd") != str(workspace):
+        raise ValueError("Session header identity, version or cwd differs")
+    identifiers = set()
+    for entry in entries[1:]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("type"), str) or entry["type"] == "session" or not isinstance(entry.get("id"), str) or not entry["id"] or entry["id"] in identifiers or "parentId" not in entry or entry["parentId"] is not None and entry["parentId"] not in identifiers:
+            raise ValueError("Session contains an invalid or incomplete entry")
+        identifiers.add(entry["id"])
+    if not any(entry.get("type") == "message" and isinstance(entry.get("message"), dict) and entry["message"].get("role") == "assistant" for entry in entries[1:]):
+        raise ValueError("Saved session has no persisted assistant history")
+    result = {"id": header["id"], "file": str(path), "cwd": str(workspace), "bytes": len(raw), "sha256": digest(raw), "header_sha256": digest(lines[0])}
+    if expected is not None and result != expected:
+        raise ValueError("Session bytes or identity changed since checkpoint")
+    if prefix is not None and (len(raw) < prefix["bytes"] or digest(raw[:prefix["bytes"]]) != prefix["sha256"] or any(result[key] != prefix[key] for key in ("id", "file", "cwd", "header_sha256"))):
+        raise ValueError("Session replaced or rewrote its prior history")
+    return result
+
+
+def saved_descriptor(task):
+    if task.get("version") != 3 or task.get("operation") not in {"run", "continue"}:
+        raise ValueError("Expected saved version 3 task")
+    session = task.get("session")
+    if not isinstance(session, dict) or set(session) != {"conversation_id", "directory", "file", "prior", "prior_sha256"} or not re.fullmatch(r"[0-9a-f]{32}", str(session["conversation_id"])):
+        raise ValueError("Invalid saved conversation descriptor")
+    dispatch = Path(task["output_directory"]).parent
+    directory = dispatch.parent / "conversations" / session["conversation_id"]
+    if not dispatch.is_absolute() or dispatch.name != task["run_id"] or session["directory"] != str(directory) or session["file"] != str(directory / "session.jsonl") or task["workspace"] != str(directory / "workspace"):
+        raise ValueError("Saved conversation paths differ from the owned dispatch")
+    if task["operation"] == "run":
+        if session["prior"] is not None or session["prior_sha256"] is not None or session["conversation_id"] != task["run_id"]:
+            raise ValueError("New saved run must reserve its own fresh conversation")
+    else:
+        prior = session["prior"]
+        if not isinstance(prior, dict) or prior.get("conversation_id") != session["conversation_id"] or not re.fullmatch(r"[0-9a-f]{32}", str(prior.get("run_id"))) or prior["run_id"] == task["run_id"] or digest(private_control_bytes(prior)) != session["prior_sha256"]:
+            raise ValueError("Invalid prior conversation checkpoint binding")
+    for path in (directory, dispatch, Path(task["workspace"]), Path(session["file"])):
+        refuse_path_links(path)
+    return session
+
+
+def validate_native_task(task):
+    if not isinstance(task, dict) or type(task.get("version")) is not int or task["version"] not in (1, 2, 3):
+        raise ValueError("Unknown native task version")
+    if task["version"] != 3:
+        return
+    fields = {"version", "run_id", "task_id", "kind", "instructions", "workspace", "output_directory", "writable_paths", "allowed_tools", "max_tool_calls", "max_turns", "source", "checks", "operation", "run_options", "runtime_defaults"}
+    metadata = task.get("operation") == "capabilities_selected"
+    if set(task) != fields | ({"selected_model"} if metadata else {"session"}):
+        raise ValueError("Native version 3 fields differ from its explicit variant")
+    public = {key: task[key] for key in ("task_id", "kind", "instructions", "writable_paths", "checks", "max_tool_calls", "max_turns", "run_options")}
+    validate_task({"version": 2, **public})
+    if metadata:
+        if task["writable_paths"] or task["checks"] or task["run_options"] or set(validate_run_options(task["selected_model"])) != {"provider", "model"}:
+            raise ValueError("Selected metadata cannot execute a task")
+    else:
+        saved_descriptor(task)
+        if task["source"].get("kind") != "git" or not re.fullmatch(r"[0-9a-f]{40,64}", str(task["source"].get("commit"))):
+            raise ValueError("Saved runs require an explicit committed source")
+
+
+def prepare_saved_workspace(root, task):
+    session = saved_descriptor(task)
+    directory = Path(session["directory"])
+    stable, staged = Path(task["workspace"]), root / "workspace"
+    retained_storage_guard(root.parent)
+    staged_manifest = workspace_manifest(staged)
+    if {name: value["sha256"] for name, value in staged_manifest["files"].items()} != task["source"]["files"] or {name: value["mode"] for name, value in staged_manifest["files"].items()} != task["source"]["modes"]:
+        raise ValueError("Staged source bytes or modes differ from approved source")
+    prior = session["prior"]
+    if prior is None:
+        directory.parent.mkdir(mode=0o700, exist_ok=True)
+        directory.mkdir(mode=0o700, exist_ok=False)
+        backup = None
+    else:
+        if (directory / "pending.json").exists():
+            raise ValueError("Conversation transition requires reconciliation")
+        if read_json(directory / "checkpoint.json") != prior or digest((directory / "checkpoint.json").read_bytes()) != session["prior_sha256"]:
+            raise ValueError("Stale or duplicate continuation checkpoint")
+        saved_session_snapshot(Path(session["file"]), stable, expected=prior["session"])
+        if workspace_manifest(stable) != prior["workspace"]:
+            raise ValueError("Prior workspace bytes or modes changed")
+        (directory / "retained").mkdir(mode=0o700, exist_ok=True)
+        backup = directory / "retained" / prior["run_id"]
+        if backup.exists():
+            raise ValueError("Prior workspace backup already exists")
+    intent = {"version": 1, "conversation_id": session["conversation_id"], "run_id": task["run_id"], "task_sha256": digest((root / "task.json").read_bytes()), "prior_sha256": session["prior_sha256"], "old_workspace": prior["workspace"] if prior else None, "new_workspace": staged_manifest, "staged": str(staged), "stable": str(stable), "backup": str(backup) if backup else None}
+    write_private_control(directory / "pending.json", intent)
+    if backup is not None:
+        stable.rename(backup)
+    staged.rename(stable)
+    if workspace_manifest(stable) != staged_manifest:
+        raise ValueError("Activated workspace differs from staged source")
+    return session
+
+
+def complete_saved_conversation(root, task, configuration, session_after):
+    session = saved_descriptor(task)
+    directory, workspace = Path(session["directory"]), Path(task["workspace"])
+    prior = session["prior"]
+    observed = saved_session_snapshot(Path(session["file"]), workspace, expected=session_after, prefix=prior["session"] if prior else None)
+    if observed["id"] != configuration["session_id"] or observed["file"] != configuration["session_file"]:
+        raise ValueError("Terminal session differs from admitted RPC identity")
+    checkpoint = {"version": 1, "conversation_id": session["conversation_id"], "run_id": task["run_id"], "task_id": task["task_id"], "task_sha256": digest((root / "task.json").read_bytes()), "source_commit": task["source"]["commit"], "prior_run_id": prior["run_id"] if prior else None, "prior_checkpoint_sha256": session["prior_sha256"], "session": observed, "workspace": workspace_manifest(workspace)}
+    retained_storage_guard(root.parent)
+    checkpoint_path = directory / "checkpoint.json"
+    if prior is None:
+        if checkpoint_path.exists():
+            raise ValueError("New conversation checkpoint already exists")
+    elif digest(checkpoint_path.read_bytes()) != session["prior_sha256"]:
+        raise ValueError("Conversation checkpoint changed during dispatch")
+    write_private_control(root / "results/conversation.json", checkpoint)
+    staged = directory / (task["run_id"] + ".checkpoint.json")
+    write_private_control(staged, checkpoint)
+    staged.replace(checkpoint_path)
+    (directory / "pending.json").rename(root / "transition-completed.json")
+    return {"checkpoint_sha256": digest(private_control_bytes(checkpoint)), "session_before": prior["session"] if prior else None, "session_after": observed, "prior_prefix_sha256": prior["session"]["sha256"] if prior else digest(b""), "continuable": True}
+
+
+def verify_conversation(results, task, receipt):
+    session = saved_descriptor(task)
+    checkpoint = read_json(Path(results) / "conversation.json")
+    prior = session["prior"]
+    expected = {"version": 1, "conversation_id": session["conversation_id"], "run_id": task["run_id"], "task_id": task["task_id"], "task_sha256": digest(json.dumps(task).encode()), "source_commit": task["source"]["commit"], "prior_run_id": prior["run_id"] if prior else None, "prior_checkpoint_sha256": session["prior_sha256"]}
+    if set(checkpoint) != set(expected) | {"session", "workspace"} or any(checkpoint.get(key) != value for key, value in expected.items()):
+        raise ValueError("Conversation checkpoint task/source identity mismatch")
+    saved = checkpoint["session"]
+    configuration = receipt["configuration"]
+    if not isinstance(saved, dict) or set(saved) != {"id", "file", "cwd", "bytes", "sha256", "header_sha256"} or saved["id"] != configuration["session_id"] or saved["file"] != session["file"] or saved["cwd"] != task["workspace"] or type(saved["bytes"]) is not int or not 0 < saved["bytes"] <= MAX_SESSION_BYTES or any(not re.fullmatch(r"[0-9a-f]{64}", str(saved[key])) for key in ("sha256", "header_sha256")):
+        raise ValueError("Returned session does not bind the admitted identity")
+    if prior and (saved["bytes"] < prior["session"]["bytes"] or any(saved[key] != prior["session"][key] for key in ("id", "file", "cwd", "header_sha256"))):
+        raise ValueError("Returned session changed its prior identity")
+    manifest = checkpoint["workspace"]
+    if not isinstance(manifest, dict) or set(manifest) != {"files", "directories"} or any(not isinstance(manifest[key], dict) or len(manifest[key]) > MAX_FILES for key in manifest) or "." not in manifest["directories"]:
+        raise ValueError("Invalid terminal workspace manifest")
+    for name, value in manifest["files"].items():
+        relative_file(name)
+        if not isinstance(value, dict) or set(value) != {"sha256", "mode"} or not re.fullmatch(r"[0-9a-f]{64}", str(value["sha256"])) or type(value["mode"]) is not int or not 0 <= value["mode"] <= 0o777:
+            raise ValueError("Invalid terminal file identity")
+    for name, mode in manifest["directories"].items():
+        if name != ".":
+            relative_file(name)
+        if type(mode) is not int or not 0 <= mode <= 0o777 or name in manifest["files"]:
+            raise ValueError("Invalid terminal directory identity")
+    expected_conversation = {"checkpoint_sha256": digest(private_control_bytes(checkpoint)), "session_before": prior["session"] if prior else None, "session_after": saved, "prior_prefix_sha256": prior["session"]["sha256"] if prior else digest(b""), "continuable": True}
+    if receipt.get("conversation") != expected_conversation or receipt.get("extension", {}).get("session") != {"id": saved["id"], "file": saved["file"], "cwd": saved["cwd"], "version": 3}:
+        raise ValueError("Returned conversation differs from terminal worker/extension bindings")
+    return checkpoint
+
+
+def inspect_saved_conversation(root, task, reconcile=False):
+    """Inspect a stopped dispatch's files; never invoke Pi, checks or rollback."""
+    session = saved_descriptor(task)
+    directory, stable = Path(session["directory"]), Path(task["workspace"])
+    retained_storage_guard(root.parent)
+    checkpoint = read_json(directory / "checkpoint.json")
+    current_session = saved_session_snapshot(Path(session["file"]), stable, expected=checkpoint["session"])
+    pending = directory / "pending.json"
+    if checkpoint.get("run_id") == task["run_id"]:
+        if checkpoint != read_json(root / "results/conversation.json") or workspace_manifest(stable) != checkpoint["workspace"]:
+            raise ValueError("Completed conversation checkpoint changed")
+        if pending.exists():
+            raise ValueError("Terminal checkpoint still has an unresolved transition")
+        return {"disposition": "terminal_checkpoint", "continuable": True, "checkpoint": checkpoint, "session": current_session}
+    if checkpoint != session["prior"] or digest((directory / "checkpoint.json").read_bytes()) != session["prior_sha256"]:
+        raise ValueError("Saved conversation no longer matches this dispatch")
+    if not pending.exists():
+        if workspace_manifest(stable) != checkpoint["workspace"]:
+            raise ValueError("Retained old workspace changed")
+        return {"disposition": "unchanged_prior_checkpoint", "continuable": True, "checkpoint": checkpoint, "session": current_session}
+    intent = read_json(pending)
+    staged, backup = root / "workspace", directory / "retained" / checkpoint["run_id"]
+    expected = {"version": 1, "conversation_id": session["conversation_id"], "run_id": task["run_id"], "task_sha256": digest((root / "task.json").read_bytes()), "prior_sha256": session["prior_sha256"], "old_workspace": checkpoint["workspace"], "staged": str(staged), "stable": str(stable), "backup": str(backup)}
+    if set(intent) != set(expected) | {"new_workspace"} or any(intent[key] != value for key, value in expected.items()):
+        raise ValueError("Transition intent does not bind this saved dispatch")
+    if stable.exists() and not backup.exists() and staged.exists() and workspace_manifest(stable) == checkpoint["workspace"] and workspace_manifest(staged) == intent["new_workspace"]:
+        if reconcile:
+            destination = root / "transition-reconciled.json"
+            if destination.exists():
+                raise ValueError("Transition reconciliation evidence already exists")
+            pending.rename(destination)
+        return {"disposition": "old_checkpoint_reconciled" if reconcile else "old_checkpoint_requires_reconcile", "continuable": bool(reconcile), "checkpoint": checkpoint, "session": current_session}
+    if stable.exists() and backup.exists() and not staged.exists() and workspace_manifest(stable) == intent["new_workspace"] and workspace_manifest(backup) == checkpoint["workspace"]:
+        return {"disposition": "new_workspace_dispatch_unresolved", "continuable": False, "checkpoint": checkpoint, "session": current_session}
+    raise ValueError("Partial or mixed saved workspace transition requires owner investigation")
+
+
+def execute_to_log(argv, cwd, log, timeout, *, remote_owner=False, env=None, storage_parent=None):
     """Cap bytes and time. Remote descendants are stopped by the external owner."""
     started = time.monotonic()
+    next_storage_check = started
     with Path(log).open("xb") as stream:
         process = subprocess.Popen(argv, cwd=cwd, stdout=stream, stderr=subprocess.STDOUT, env=env)
         try:
             while process.poll() is None:
+                if storage_parent is not None and time.monotonic() >= next_storage_check:
+                    retained_storage_guard(storage_parent)
+                    next_storage_check = time.monotonic() + 1
                 if time.monotonic() - started > timeout or Path(log).stat().st_size > MAX_OUTPUT_BYTES:
                     raise TimeoutError("Command deadline or output limit exceeded")
                 time.sleep(0.05)
             if Path(log).stat().st_size > MAX_OUTPUT_BYTES:
                 raise ValueError("Command output limit exceeded")
+            if storage_parent is not None:
+                retained_storage_guard(storage_parent)
             return process.returncode
         finally:
             if not remote_owner and process.poll() is None:
@@ -257,7 +525,7 @@ def inspect_extension_events(path, task, pi_events, task_sha256):
     if kinds[0] != "task_loaded" or kinds.count("task_loaded") != 1 or kinds.count("handoff") != 1 or kinds.count("agent_settled") != 1 or kinds.count("session_shutdown") != 1 or kinds[-2:] != ["agent_settled", "session_shutdown"]:
         raise ValueError("Incomplete or unordered extension lifecycle")
     allowed_kinds = {"task_loaded", "tool_call", "handoff", "agent_settled", "session_shutdown"}
-    if task["version"] == 2:
+    if task["version"] in (2, 3):
         allowed_kinds.add("run_configuration")
         if kinds.count("run_configuration") != 1 or kinds[1] != "run_configuration":
             raise ValueError("Missing or unordered extension run configuration")
@@ -286,10 +554,18 @@ def inspect_extension_events(path, task, pi_events, task_sha256):
     if not 1 <= events[handoff_index]["turns"] <= pi_events["assistant_turns"] or any(event["turns"] != pi_events["assistant_turns"] for event in events[-2:]):
         raise ValueError("Extension turn accounting differs from Pi")
     result = {"event_log_sha256": digest(raw), "model": events[0].get("model"), "tool_calls": len(calls), "assistant_turns": pi_events["assistant_turns"]}
-    if task["version"] == 2:
+    if task["version"] in (2, 3):
         result["configuration"] = validate_run_options(events[1].get("configuration"))
         if set(result["configuration"]) != {"provider", "model", "thinking"}:
             raise ValueError("Incomplete extension run configuration")
+    if task.get("session"):
+        saved_descriptor(task)
+        session = events[0].get("session")
+        if not isinstance(session, dict) or set(session) != {"id", "file", "cwd", "version"} or session.get("version") != 3 or session.get("file") != task["session"]["file"] or session.get("cwd") != task["workspace"] or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", str(session.get("id"))) or any(event.get("session") != session for event in events):
+            raise ValueError("Extension saved session identity changed")
+        if task["session"]["prior"] and session["id"] != task["session"]["prior"]["session"]["id"]:
+            raise ValueError("Extension resumed a different official session")
+        result["session"] = session
     return result
 
 
@@ -302,7 +578,7 @@ def rpc_model(value):
     return {"provider": model_identifier(value.get("provider")), "id": model_identifier(value.get("id"))}
 
 
-def rpc_data(command, data):
+def rpc_data(command, data, session=None):
     """Discard model API objects, headers, URLs and free-form error messages."""
     if command == "get_available_models":
         if not isinstance(data, dict) or not isinstance(data.get("models"), list) or len(data["models"]) > 1000:
@@ -319,14 +595,16 @@ def rpc_data(command, data):
     if command == "get_state":
         if not isinstance(data, dict) or any(type(data.get(key)) is not bool for key in ("isStreaming", "isCompacting")) or type(data.get("pendingMessageCount")) is not int or data["pendingMessageCount"] < 0:
             raise ValueError("Invalid RPC state")
-        if data.get("sessionFile") is not None or not isinstance(data.get("sessionId"), str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", data["sessionId"]):
-            raise ValueError("RPC must use an exact nonpersistent session")
+        expected_file = session["file"] if session else None
+        expected_id = session["prior"]["session"]["id"] if session and session["prior"] else None
+        if data.get("sessionFile") != expected_file or not isinstance(data.get("sessionId"), str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", data["sessionId"]) or expected_id is not None and data["sessionId"] != expected_id:
+            raise ValueError("RPC session differs from the exact saved or ephemeral contract")
         thinking = data.get("thinkingLevel")
         if not isinstance(thinking, str) or thinking not in THINKING_LEVELS:
             raise ValueError("Invalid effective thinking level")
         return {"model": rpc_model(data.get("model")), "thinkingLevel": thinking,
                 "isStreaming": data["isStreaming"], "isCompacting": data["isCompacting"],
-                "pendingMessageCount": data["pendingMessageCount"], "sessionId": data["sessionId"], "sessionFile": None}
+                "pendingMessageCount": data["pendingMessageCount"], "sessionId": data["sessionId"], "sessionFile": expected_file}
     if command == "set_model":
         return rpc_model(data)
     if command in {"set_thinking_level", "prompt"}:
@@ -347,8 +625,10 @@ def configuration_event_record(value, request_id, command, arguments, previous_l
 
 class PiRpc:
     """One bounded stdlib RPC child; OpenShell remains its lifecycle owner."""
-    def __init__(self, command, workspace, output, deadline, env):
+    def __init__(self, command, workspace, output, deadline, env, session=None):
         self.deadline, self.output = deadline, output
+        self.session = session
+        self.next_storage_check = 0
         self.pending, self.responses, self.records = {}, {}, []
         self.pending_arguments, self.configuration_events = {}, set()
         self.observed_thinking = None
@@ -409,7 +689,7 @@ class PiRpc:
             if value.get("success") is not True:
                 self.record({"type": "response", "id": request_id, "command": command, "success": False})
                 raise ValueError("Pi RPC command refused: " + command)
-            safe = rpc_data(command, value.get("data"))
+            safe = rpc_data(command, value.get("data"), self.session)
             if command == "get_state":
                 if self.observed_thinking is not None and safe["thinkingLevel"] != self.observed_thinking:
                     raise ValueError("RPC thinking changed without a bound configuration event")
@@ -443,6 +723,13 @@ class PiRpc:
             raise ValueError("Pi event output exceeded")
 
     def pump(self):
+        if self.session:
+            if time.monotonic() >= self.next_storage_check:
+                retained_storage_guard(Path(self.session["directory"]).parent.parent)
+                self.next_storage_check = time.monotonic() + 1
+            session_path = Path(self.session["file"])
+            if session_path.is_symlink() or session_path.exists() and (not session_path.is_file() or session_path.stat().st_size > MAX_SESSION_BYTES) or self.session["prior"] is not None and not session_path.exists():
+                raise ValueError("Saved session disappeared or exceeded observed bounds")
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise ValueError("Pi RPC deadline exceeded")
@@ -524,6 +811,20 @@ def desired_configuration(task, models):
     return {"provider": candidates[0]["provider"], "model": candidates[0]["id"], "thinking": requested.get("thinking", defaults["thinking"])}
 
 
+def metadata_task(task):
+    return task.get("operation") in {"capabilities", "capabilities_selected"}
+
+
+def selected_metadata_model(task, models):
+    selection = validate_run_options(task["selected_model"])
+    if set(selection) != {"provider", "model"}:
+        raise ValueError("Selected metadata requires exactly provider and model")
+    matches = [model for model in models if model == {"provider": selection["provider"], "id": selection["model"]}]
+    if len(matches) != 1:
+        raise ValueError("Selected metadata model is unavailable or ambiguous")
+    return selection
+
+
 def require_rpc_idle(state, effective=None, session_id=None):
     if state["isStreaming"] or state["isCompacting"] or state["pendingMessageCount"] != 0:
         raise ValueError("Pi RPC is not idle with an empty queue")
@@ -534,22 +835,37 @@ def require_rpc_idle(state, effective=None, session_id=None):
 
 
 def rpc_configuration_record(task, models, levels, effective, session_id, results):
-    task_run = task["operation"] == "run"
-    return {"version": 1, "operation": task["operation"], "requested": task["run_options"],
+    task_run = not metadata_task(task)
+    record = {"version": 1, "operation": task["operation"], "requested": task["run_options"],
             "defaults": task["runtime_defaults"], "available_models": models,
             "supported_thinking_levels": levels, "effective": effective,
             "session_id": session_id, "session_file": None, "prompt_sent": task_run,
             "settled": task_run, "shutdown": "stdin-eof",
             "rpc_log_sha256": digest((results / "rpc-events.jsonl").read_bytes()),
             "stderr_sha256": digest((results / "rpc/stderr.log").read_bytes())}
+    if task["operation"] == "capabilities_selected":
+        record.update(version=2, requested=task["selected_model"],
+                      profile_default_supported=task["runtime_defaults"]["thinking"] in levels)
+    elif task.get("session"):
+        record.update(version=2, session_file=task["session"]["file"])
+    return record
 
 
 def run_rpc(root, task, launch, deadline, env):
-    metadata = task["operation"] == "capabilities"
-    command = [*launch["pi_argv"], "--offline", "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve", "--tools", "" if metadata else ",".join([*task["allowed_tools"], "coordination_status", "coordination_handoff"]), "--mode", "rpc"]
+    metadata = metadata_task(task)
+    selected_metadata = task["operation"] == "capabilities_selected"
+    session = saved_descriptor(task) if task.get("session") else None
+    session_arguments = ["--no-session"]
+    if session:
+        if session["prior"]:
+            saved_session_snapshot(Path(session["file"]), Path(task["workspace"]), expected=session["prior"]["session"])
+        elif Path(session["file"]).exists():
+            raise ValueError("New saved session file must be absent")
+        session_arguments = ["--session", session["file"], "--session-dir", session["directory"]]
+    command = [*launch["pi_argv"], "--offline", *session_arguments, "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve", "--tools", "" if metadata else ",".join([*task["allowed_tools"], "coordination_status", "coordination_handoff"]), "--mode", "rpc"]
     if not metadata:
         command += ["--extension", str(root / "extension.js"), "--coordination-task", str(root / "task.json")]
-    rpc = PiRpc(command, root / "workspace", root / "results", deadline, env)
+    rpc = PiRpc(command, Path(task["workspace"]), root / "results", deadline, env, session=session)
     try:
         models_request = rpc.send("get_available_models")
         initial_request = rpc.send("get_state")
@@ -557,17 +873,23 @@ def run_rpc(root, task, launch, deadline, env):
         initial = rpc.wait(initial_request)
         observed = require_rpc_idle(initial)
         effective = observed if metadata else desired_configuration(task, models)
+        if selected_metadata:
+            effective = {**selected_metadata_model(task, models), "thinking": observed["thinking"]}
         model_changed = initial["model"] != {"provider": effective["provider"], "id": effective["model"]}
         if model_changed:
             selected = rpc.call("set_model", provider=effective["provider"], modelId=effective["model"])
             if selected != {"provider": effective["provider"], "id": effective["model"]}:
                 raise ValueError("Pi selected a different model")
         levels = rpc.call("get_available_thinking_levels")["levels"]
-        if effective["thinking"] not in levels:
+        if not selected_metadata and effective["thinking"] not in levels:
             raise ValueError("Selected model does not support requested thinking")
-        if model_changed or initial["thinkingLevel"] != effective["thinking"]:
+        if not selected_metadata and (model_changed or initial["thinkingLevel"] != effective["thinking"]):
             rpc.call("set_thinking_level", level=effective["thinking"])
         admitted = rpc.call("get_state")
+        if selected_metadata:
+            effective = {**selected_metadata_model(task, models), "thinking": admitted["thinkingLevel"]}
+            if effective["thinking"] not in levels:
+                raise ValueError("Selected metadata thinking is not supported")
         require_rpc_idle(admitted, effective, initial["sessionId"])
         if not metadata:
             rpc.call("prompt", message=RPC_PROMPT)
@@ -608,7 +930,7 @@ def verify_rpc_configuration(results, task):
             if set(record) != {"type", "id", "command", "success", "data"} or record["success"] is not True or not isinstance(record["id"], str) or record["id"] in responses:
                 raise ValueError("Invalid RPC response binding")
             matched = [request for _position, request in requests if request["id"] == record["id"]]
-            if len(matched) != 1 or record["command"] != matched[0]["command"] or rpc_data(record["command"], record["data"]) != record["data"]:
+            if len(matched) != 1 or record["command"] != matched[0]["command"] or rpc_data(record["command"], record["data"], task.get("session")) != record["data"]:
                 raise ValueError("RPC response differs from its safe request contract")
             if record["command"] == "get_state":
                 thinking = record["data"]["thinkingLevel"]
@@ -648,8 +970,11 @@ def verify_rpc_configuration(results, task):
         raise ValueError("RPC metadata preflight missing")
     models, initial = data(0)["models"], data(1)
     observed = require_rpc_idle(initial)
-    metadata = task["operation"] == "capabilities"
+    metadata = metadata_task(task)
+    selected_metadata = task["operation"] == "capabilities_selected"
     effective = observed if metadata else desired_configuration(task, models)
+    if selected_metadata:
+        effective = {**selected_metadata_model(task, models), "thinking": observed["thinking"]}
     target_model = {"provider": effective["provider"], "id": effective["model"]}
     changed = initial["model"] != target_model
     expected = [("get_available_models", {}), ("get_state", {})]
@@ -660,12 +985,16 @@ def verify_rpc_configuration(results, task):
     levels_index = len(expected)
     expected.append(("get_available_thinking_levels", {}))
     levels = data(levels_index)["levels"]
-    if effective["thinking"] not in levels:
+    if not selected_metadata and effective["thinking"] not in levels:
         raise ValueError("RPC selected unsupported thinking")
-    if changed or initial["thinkingLevel"] != effective["thinking"]:
+    if not selected_metadata and (changed or initial["thinkingLevel"] != effective["thinking"]):
         expected.append(("set_thinking_level", {"level": effective["thinking"]}))
     admitted_index = len(expected)
     expected.append(("get_state", {}))
+    if selected_metadata:
+        effective = {**selected_metadata_model(task, models), "thinking": data(admitted_index)["thinkingLevel"]}
+        if effective["thinking"] not in levels:
+            raise ValueError("RPC selected metadata thinking is unsupported")
     if not metadata:
         expected += [("prompt", {"message_sha256": digest(RPC_PROMPT.encode())}), ("get_state", {})]
     if [(request["command"], request["arguments"]) for _index, request in requests] != expected:
@@ -688,22 +1017,25 @@ def worker(root):
     """Runs only inside the caller-owned disposable OpenShell sandbox."""
     root = Path(root).resolve(strict=True)
     task, launch = read_json(root / "task.json"), read_json(root / "launch.json")
-    workspace, output = root / "workspace", root / "results"
+    validate_native_task(task)
+    workspace, output = Path(task["workspace"]), root / "results"
     receipt = {"version": task["version"], "run_id": task["run_id"], "task_id": task["task_id"], "started_at": utc_now(), "outcome": "incomplete", "checks": []}
     write_new_json(root / "worker-started.json", receipt)
     deadline = time.monotonic() + launch["wall_seconds"]
-    before = snapshot(workspace)
     try:
+        if task.get("session"):
+            prepare_saved_workspace(root, task)
+        before = snapshot(workspace)
         if {p: digest(b) for p, b in before.items()} != task["source"]["files"]:
             raise ValueError("Exported source differs from frozen source")
         command = [*launch["pi_argv"], "--model", launch["model"], "--thinking", launch["thinking"], "--offline", "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve", "--tools", ",".join([*task["allowed_tools"], "coordination_status", "coordination_handoff"]), "--extension", str(root / "extension.js"), "--coordination-task", str(root / "task.json"), "--mode", "json", "-p", "Complete the assigned coordination task. Use coordination_status to inspect it and coordination_handoff to return your work. Do not execute verification commands; the coordinator runs declared checks after your handoff."]
         env = os.environ.copy()
         env.update(launch["environment"])
         env["PYTHONDONTWRITEBYTECODE"] = "1"
-        if task["version"] == 2:
+        if task["version"] in (2, 3):
             receipt["configuration"] = run_rpc(root, task, launch, deadline, env)
             receipt["pi_exit_code"] = 0
-            if task["operation"] == "capabilities":
+            if metadata_task(task):
                 if snapshot(workspace) != before:
                     raise ValueError("Metadata discovery changed source")
                 receipt["outcome"] = "capabilities"
@@ -716,8 +1048,12 @@ def worker(root):
             raise ValueError("Pi exited unsuccessfully")
         receipt["events"] = inspect_events(output / "pi-events.jsonl", task["max_tool_calls"], task["max_turns"])
         receipt["extension"] = inspect_extension_events(output / "extension-events.jsonl", task, receipt["events"], digest((root / "task.json").read_bytes()))
-        if task["version"] == 2 and receipt["extension"].get("configuration") != receipt["configuration"]["effective"]:
+        if task["version"] in (2, 3) and receipt["extension"].get("configuration") != receipt["configuration"]["effective"]:
             raise ValueError("Extension effective options differ from RPC admission")
+        if task.get("session"):
+            session_after = saved_session_snapshot(Path(task["session"]["file"]), workspace, prefix=task["session"]["prior"]["session"] if task["session"]["prior"] else None)
+            if receipt["extension"].get("session") != {"id": receipt["configuration"]["session_id"], "file": task["session"]["file"], "cwd": task["workspace"], "version": 3}:
+                raise ValueError("Extension saved-session identity differs from RPC")
         report = read_json(output / "model-report.json")
         if report.get("run_id") != task["run_id"] or report.get("task_id") != task["task_id"] or report.get("model_self_report") is not True or report.get("task_sha256") != digest((root / "task.json").read_bytes()):
             raise ValueError("Model handoff identity mismatch")
@@ -732,7 +1068,7 @@ def worker(root):
             started = {"name": check["name"], "argv": check["argv"], "started_at": utc_now()}
             write_new_json(output / (check["name"] + ".started.json"), started)
             log = output / (check["name"] + ".log")
-            code = execute_to_log(check["argv"], workspace, log, min(check["timeout_seconds"], deadline - time.monotonic()), remote_owner=True, env=env)
+            code = execute_to_log(check["argv"], workspace, log, min(check["timeout_seconds"], deadline - time.monotonic()), remote_owner=True, env=env, storage_parent=root.parent if task.get("session") else None)
             result = {**started, "ended_at": utc_now(), "exit_code": code, "log_bytes": log.stat().st_size, "log_sha256": digest(log.read_bytes())}
             write_new_json(output / (check["name"] + ".result.json"), result)
             receipt["checks"].append(result)
@@ -759,6 +1095,8 @@ def worker(root):
                 patch.writelines(difflib.unified_diff(old.splitlines(True), new.splitlines(True), fromfile="a/" + name if name in before else "/dev/null", tofile="b/" + name if name in after else "/dev/null"))
         receipt["checks_passed"] = all(c["exit_code"] == 0 for c in receipt["checks"]) if receipt["checks"] else None
         receipt["model_status"] = report.get("status")
+        if task.get("session"):
+            receipt["conversation"] = complete_saved_conversation(root, task, receipt["configuration"], session_after)
         receipt["outcome"] = "returned" if report.get("status") == "completed" and receipt["checks_passed"] is not False and receipt["model_report_matches_changes"] else "failed"
         receipt["acceptance"] = "not_granted"
         receipt["artifact_sha256"] = {name: digest(data) for name, data in snapshot(output).items()}
@@ -784,10 +1122,10 @@ def verify_return(results, task, source_files, run_id):
         raise ValueError("Returned artifact manifest differs from actual bytes")
     if receipt.get("version") != task["version"]:
         raise ValueError("Worker receipt version differs from task")
-    metadata = task.get("operation") == "capabilities"
+    metadata = metadata_task(task)
     if receipt.get("run_id") != run_id or receipt.get("task_id") != task["task_id"] or receipt.get("outcome") != ("capabilities" if metadata else "returned") or type(receipt.get("pi_exit_code")) is not int or receipt["pi_exit_code"] != 0 or receipt.get("acceptance") != "not_granted":
         raise ValueError("Worker identity or completion contract mismatch")
-    if task["version"] == 2:
+    if task["version"] in (2, 3):
         configuration = verify_rpc_configuration(results, task)
         if receipt.get("configuration") != configuration:
             raise ValueError("Worker configuration differs from the verified RPC return")
@@ -806,7 +1144,7 @@ def verify_return(results, task, source_files, run_id):
     extension = inspect_extension_events(results / "extension-events.jsonl", task, events, digest(json.dumps(task).encode()))
     if receipt.get("extension") != extension:
         raise ValueError("Recorded extension lifecycle differs from returned log")
-    if task["version"] == 2 and extension.get("configuration") != configuration["effective"]:
+    if task["version"] in (2, 3) and extension.get("configuration") != configuration["effective"]:
         raise ValueError("Extension configuration differs from the verified RPC return")
     checks = receipt.get("checks")
     if not isinstance(checks, list) or len(checks) != len(task["checks"]):
@@ -824,6 +1162,8 @@ def verify_return(results, task, source_files, run_id):
         if len(raw) != check["log_bytes"] or digest(raw) != check["log_sha256"]:
             raise ValueError("Check output differs from its receipt")
     verify_changes(results, actual, task, source_files, receipt, report)
+    if task.get("session"):
+        verify_conversation(results, task, receipt)
     return receipt
 
 
@@ -1011,10 +1351,47 @@ def cleanup_owner(owner, profile, receipt, protected):
         receipt["protected_readback_error"] = str(error)
 
 
-def run_task(task_file, profile_file, output, lock_root, *, capabilities_only=False):
+def continuation_checkpoint(previous_directory, profile):
+    previous_directory = Path(previous_directory).absolute()
+    previous = read_json(previous_directory / "receipt.json")
+    recovered = previous.get("operation") == "recovery"
+    origin = Path(previous["recovered_from"]) if recovered and "recovered_from" in previous else previous_directory
+    original, task, files, hashes = recovery_inputs(origin, profile, allow_saved_success=True)
+    if task["version"] != 3 or not task.get("session") or previous.get("cleanup_complete") is not True or previous.get("protected_unchanged") is not True:
+        raise ValueError("Continue requires verified stopped saved-session custody")
+    if recovered:
+        if previous.get("recovery_valid") is not True or previous.get("original_artifact_sha256") != hashes or previous.get("failed_run_id") != task["run_id"]:
+            raise ValueError("Recovery does not bind the original saved dispatch")
+        evidence = verify_recovered_artifacts(previous_directory / "results", task, files)
+        checkpoint = previous.get("continuation_checkpoint")
+        inspection = read_json(previous_directory / "conversation-inspection.json")
+        if previous.get("conversation_valid") is not True or previous.get("inspection_sha256") != digest((previous_directory / "conversation-inspection.json").read_bytes()) or inspection.get("continuable") is not True or inspection.get("checkpoint") != checkpoint:
+            raise ValueError("Recovered conversation is not continuable")
+        if checkpoint != task["session"]["prior"]:
+            if evidence.get("conversation_valid") is not True or checkpoint != read_json(previous_directory / "results/conversation.json"):
+                raise ValueError("Recovered terminal checkpoint differs from evidence")
+        return checkpoint
+    else:
+        if original.get("delivery_valid") is not True:
+            raise ValueError("Recover the failed saved dispatch before continuing")
+        verify_return(previous_directory / "results", task, files, task["run_id"])
+    checkpoint = read_json(previous_directory / "results/conversation.json")
+    return checkpoint
+
+
+def run_task(task_file, profile_file, output, lock_root, *, capabilities_only=False, selected_model=None, save_session=False, previous_directory=None):
+    if selected_model is not None:
+        if not capabilities_only or set(validate_run_options(selected_model)) != {"provider", "model"}:
+            raise ValueError("Selected metadata requires exactly provider and model")
     task = validate_task({"version": 2, "task_id": "capabilities", "kind": "validation", "instructions": "Inspect configured runtime metadata without model work.", "writable_paths": [], "checks": [], "wall_seconds": 30} if capabilities_only else read_json(task_file))
     profile = profile_settings(profile_file, require_qualified_model=True)
     files, source = frozen_source(task)
+    if capabilities_only and (save_session or previous_directory is not None):
+        raise ValueError("Metadata cannot create or continue a saved conversation")
+    saved = save_session or previous_directory is not None
+    if saved and source.get("kind") != "git":
+        raise ValueError("Saved dispatch requires an explicit committed source")
+    prior = continuation_checkpoint(previous_directory, profile) if previous_directory is not None else None
     output = Path(output).absolute()
     output.mkdir(parents=True, exist_ok=False)
     owner, run_id = OpenShellOwner(profile), uuid.uuid4().hex
@@ -1024,6 +1401,13 @@ def run_task(task_file, profile_file, output, lock_root, *, capabilities_only=Fa
     remote = str(remote_parent / run_id)
     remote_archive = str(remote_parent.parent / ("codex-pi-" + run_id + ".tar"))
     native_task = {"version": 2, "run_id": run_id, "task_id": task["task_id"], "kind": task["kind"], "instructions": task["instructions"], "workspace": remote + "/workspace", "output_directory": remote + "/results", "writable_paths": task["writable_paths"], "allowed_tools": sorted(TOOLS if task["writable_paths"] else TOOLS - {"write", "edit"}), "max_tool_calls": task.get("max_tool_calls", 40), "max_turns": task.get("max_turns", 32), "source": source, "checks": task["checks"], "operation": "capabilities" if capabilities_only else "run", "run_options": task.get("run_options", {}), "runtime_defaults": {"model": profile["model"], "thinking": profile.get("thinking", "high")}}
+    if selected_model is not None:
+        native_task.update(version=3, operation="capabilities_selected", selected_model=selected_model)
+    if saved:
+        conversation_id = prior["conversation_id"] if prior else run_id
+        conversation_directory = str(remote_parent / "conversations" / conversation_id)
+        native_task.update(version=3, operation="continue" if prior else "run", workspace=conversation_directory + "/workspace", session={"conversation_id": conversation_id, "directory": conversation_directory, "file": conversation_directory + "/session.jsonl", "prior": prior, "prior_sha256": digest(private_control_bytes(prior)) if prior else None})
+    validate_native_task(native_task)
     if len(json.dumps(native_task).encode()) > 1024 * 1024:
         raise ValueError("Exported task manifest exceeds 1 MiB")
     launch = {"pi_argv": profile["pi_argv"], "model": profile["model"], "thinking": profile.get("thinking", "high"), "environment": profile.get("environment", {}), "checks": task["checks"], "wall_seconds": task.get("wall_seconds", 600)}
@@ -1036,7 +1420,7 @@ def run_task(task_file, profile_file, output, lock_root, *, capabilities_only=Fa
             info.size = len(data)
             info.mode = source["modes"].get(name.removeprefix("workspace/"), 0o600) if name.startswith("workspace/") else 0o600
             archive.addfile(info, io.BytesIO(data))
-    receipt = {"version": 2, "run_id": run_id, "task_id": task["task_id"], "kind": task["kind"], "started_at": utc_now(), "source": source, "input_sha256": digest(archive_path.read_bytes()), "remote_artifacts": remote + "/results", "cleanup_complete": False, "outcome": "incomplete"}
+    receipt = {"version": native_task["version"], "run_id": run_id, "task_id": task["task_id"], "kind": task["kind"], "started_at": utc_now(), "source": source, "input_sha256": digest(archive_path.read_bytes()), "remote_artifacts": remote + "/results", "cleanup_complete": False, "outcome": "incomplete"}
     write_new_json(output / "started.json", receipt)
     with exclusive_owner(profile, lock_root) as journal:
         if journal.exists() and not read_json(journal).get("cleanup_complete"):
@@ -1096,14 +1480,14 @@ with tarfile.open(p) as archive:
     return receipt
 
 
-def recovery_inputs(failed_directory, profile):
+def recovery_inputs(failed_directory, profile, *, allow_saved_success=False):
     """Read only the retained export, never the current repository or remote path."""
     failed_directory = Path(failed_directory)
     if failed_directory.is_symlink() or not failed_directory.is_dir():
         raise ValueError("Expected a regular failed-run directory")
     started = read_json(failed_directory / "started.json")
     original = read_json(failed_directory / "receipt.json")
-    if not isinstance(started, dict) or not isinstance(original, dict) or original.get("delivery_valid") is not False:
+    if not isinstance(started, dict) or not isinstance(original, dict) or original.get("delivery_valid") is not False and not (allow_saved_success and original.get("version") == 3 and original.get("delivery_valid") is True):
         raise ValueError("Only a retained unsuccessful delivery may be recovered")
     run_id = original.get("run_id")
     if not isinstance(run_id, str) or not re.fullmatch(r"[0-9a-f]{32}", run_id):
@@ -1127,20 +1511,25 @@ def recovery_inputs(failed_directory, profile):
     if not isinstance(task, dict) or not isinstance(launch, dict):
         raise ValueError("Invalid retained task/launch")
     expected_keys = {"version", "run_id", "task_id", "kind", "instructions", "workspace", "output_directory", "writable_paths", "allowed_tools", "max_tool_calls", "max_turns", "source", "checks"}
-    if task.get("version") == 2:
+    if task.get("version") in (2, 3):
         expected_keys |= {"operation", "run_options", "runtime_defaults"}
-        if task.get("operation") != "run":
+        if task.get("version") == 3:
+            expected_keys.add("session")
+        if task.get("operation") not in ({"run", "continue"} if task.get("version") == 3 else {"run"}):
             raise ValueError("Only task execution evidence is recoverable")
     if set(task) != expected_keys:
         raise ValueError("Unexpected retained native task fields")
     public_task = {key: task[key] for key in ("version", "task_id", "kind", "instructions", "writable_paths", "checks", "max_tool_calls", "max_turns")}
-    if task["version"] == 2:
+    if task["version"] in (2, 3):
+        public_task["version"] = 2
         public_task["run_options"] = task["run_options"]
         if task["runtime_defaults"] != {"model": launch.get("model"), "thinking": launch.get("thinking")}:
             raise ValueError("Retained runtime defaults differ from launch")
     validate_task(public_task)
+    validate_native_task(task)
     remote = str(PurePosixPath(profile.get("remote_parent", "/sandbox/codex-pi")) / run_id)
-    if task["run_id"] != run_id or task["task_id"] != original["task_id"] or task["kind"] != original["kind"] or task["source"] != original["source"] or task["workspace"] != remote + "/workspace" or task["output_directory"] != remote + "/results" or original["remote_artifacts"] != task["output_directory"]:
+    expected_workspace = task["session"]["directory"] + "/workspace" if task.get("session") else remote + "/workspace"
+    if task["run_id"] != run_id or task["task_id"] != original["task_id"] or task["kind"] != original["kind"] or task["source"] != original["source"] or task["workspace"] != expected_workspace or task["output_directory"] != remote + "/results" or original["remote_artifacts"] != task["output_directory"]:
         raise ValueError("Retained task/source/remote identity mismatch")
     if task["allowed_tools"] != sorted(TOOLS if task["writable_paths"] else TOOLS - {"write", "edit"}) or launch.get("checks") != task["checks"]:
         raise ValueError("Retained tools/check contract mismatch")
@@ -1165,8 +1554,10 @@ def verify_recovered_artifacts(results, task, source_files):
         raise ValueError("Expected a regular recovered results directory")
     actual = snapshot(results)
     allowed = {"worker-receipt.json", "model-report.json", "pi-events.jsonl", "extension-events.jsonl", "changes.json", "changes.patch"}
-    if task["version"] == 2:
+    if task["version"] in (2, 3):
         allowed |= {"rpc-events.jsonl", "rpc/stderr.log", "rpc-configuration.json"}
+    if task.get("session"):
+        allowed.add("conversation.json")
     allowed.update(check["name"] + suffix for check in task["checks"] for suffix in (".started.json", ".result.json", ".log"))
     if any(name not in allowed and not name.startswith("changed-files/") for name in actual):
         raise ValueError("Unexpected recovered artifact")
@@ -1179,7 +1570,7 @@ def verify_recovered_artifacts(results, task, source_files):
         raise ValueError("Recovered worker version differs from task")
     if "acceptance" in worker_receipt and worker_receipt["acceptance"] != "not_granted":
         raise ValueError("Recovered worker claims unauthorized acceptance")
-    if task["version"] == 2:
+    if task["version"] in (2, 3):
         for name in ("rpc-events.jsonl", "rpc/stderr.log"):
             if len(actual.get(name, b"")) > MAX_OUTPUT_BYTES:
                 raise ValueError("Recovered RPC output exceeds limit")
@@ -1234,7 +1625,7 @@ def verify_recovered_artifacts(results, task, source_files):
     if "extension" in worker_receipt:
         if events is None or "extension-events.jsonl" not in actual or worker_receipt["extension"] != inspect_extension_events(results / "extension-events.jsonl", task, events, task_hash):
             raise ValueError("Recovered extension binding mismatch")
-        if task["version"] == 2 and worker_receipt["extension"].get("configuration") != worker_receipt.get("configuration", {}).get("effective"):
+        if task["version"] in (2, 3) and worker_receipt["extension"].get("configuration") != worker_receipt.get("configuration", {}).get("effective"):
             raise ValueError("Recovered extension/RPC configuration differs")
     # An interrupted final JSONL write may be incomplete. Every complete extension
     # record that is present must still bind the retained task, even without a receipt.
@@ -1302,18 +1693,26 @@ def verify_recovered_artifacts(results, task, source_files):
         raise ValueError("Recovered change bytes lack their source manifest")
     complete = all(key in worker_receipt for key in ("artifact_sha256", "events", "extension", "model_report_sha256", "pi_exit_code", "checks", "checks_passed", "model_status", "acceptance", "ended_at")) and has_changes and len(completed_results) == len(task["checks"])
     if complete:
-        if task["version"] == 2 and "configuration" not in worker_receipt:
+        if task["version"] in (2, 3) and "configuration" not in worker_receipt:
             raise ValueError("Recovered terminal RPC configuration is missing")
         expected_outcome = "returned" if report.get("status") == "completed" and worker_receipt["checks_passed"] is not False and worker_receipt.get("model_report_matches_changes") is True else "failed"
         if worker_receipt["outcome"] != expected_outcome or worker_receipt["pi_exit_code"] != 0:
             raise ValueError("Recovered worker outcome contradicts terminal evidence")
+    conversation_valid = False
+    if task.get("session") and "conversation.json" in actual:
+        if complete:
+            verify_conversation(results, task, worker_receipt)
+            conversation_valid = True
+        elif "conversation" in worker_receipt:
+            raise ValueError("Incomplete worker cannot claim a continuable conversation")
     return {"evidence_status": "complete" if complete else "partial", "available_bindings_valid": True,
+            **({"conversation_valid": conversation_valid} if task.get("session") else {}),
             "worker_outcome": worker_receipt.get("outcome"), "checks": checks,
             "artifact_sha256": {name: digest(data) for name, data in actual.items()},
             "provenance": "retained-input and available-record byte bindings; not independent issuer attestation"}
 
 
-def recover_task(failed_directory, profile_file, output, lock_root):
+def recover_task(failed_directory, profile_file, output, lock_root, *, reconcile_conversation=False):
     profile = profile_settings(profile_file)
     original, task, source_files, original_hashes = recovery_inputs(failed_directory, profile)
     output = Path(output).absolute()
@@ -1326,13 +1725,18 @@ def recover_task(failed_directory, profile_file, output, lock_root):
                "remote_artifacts": original["remote_artifacts"], "started_at": utc_now(),
                "cleanup_complete": False, "outcome": "incomplete", "recovery_valid": False,
                "delivery_valid": False, "task_delivery_valid": False, "acceptance": "not_granted"}
+    if task.get("session"):
+        receipt.update(version=2, recovered_from=str(Path(failed_directory).absolute()), conversation_valid=False)
+    elif reconcile_conversation:
+        raise ValueError("Conversation reconciliation requires a saved dispatch")
     with exclusive_owner(profile, lock_root) as journal:
         prior = read_json(journal)
         origin = prior.get("failed_run_id", prior.get("run_id"))
         input_hash = prior.get("failed_input_sha256", prior.get("input_sha256"))
-        if origin != original["run_id"] or input_hash != original["input_sha256"] or prior.get("task_id") != original["task_id"] or prior.get("delivery_valid") is True or prior.get("cleanup_complete") is not True:
+        legacy_mismatch = origin != original["run_id"] or input_hash != original["input_sha256"] or prior.get("task_id") != original["task_id"] or prior.get("delivery_valid") is True
+        if prior.get("cleanup_complete") is not True or (not task.get("session") and legacy_mismatch) or task.get("session") and prior.get("protected_unchanged") is not True:
             raise ValueError("Latest failed run does not have resolved owner custody")
-        if prior.get("operation") == "recovery" and prior.get("original_receipt_sha256") != original_hashes["receipt.json"]:
+        if not task.get("session") and prior.get("operation") == "recovery" and prior.get("original_receipt_sha256") != original_hashes["receipt.json"]:
             raise ValueError("Recovery origin receipt changed")
         expected = prior.get("sandbox_running", prior.get("sandbox_before", {}))
         stopped = prior.get("sandbox_after", {})
@@ -1357,6 +1761,21 @@ def recover_task(failed_directory, profile_file, output, lock_root):
                 owner.command("download", profile["sandbox_name"], receipt["remote_artifacts"], str(output / "results"))
                 receipt["download_complete"] = True
                 receipt["evidence"] = verify_recovered_artifacts(output / "results", task, source_files)
+                if task.get("session"):
+                    # Execute only the retained, hash-bound runner's inspection function.
+                    remote = str(PurePosixPath(original["remote_artifacts"]).parent)
+                    payload = safe_archive_files((Path(failed_directory) / "inputs.tar").read_bytes())
+                    script = "import hashlib,json,pathlib,runpy,sys; p=pathlib.Path(sys.argv[1]); assert hashlib.sha256(p.read_bytes()).hexdigest()==sys.argv[2]; t=p.parent/'task.json'; assert hashlib.sha256(t.read_bytes()).hexdigest()==sys.argv[3]; m=runpy.run_path(str(p)); print(json.dumps(m['inspect_saved_conversation'](p.parent,json.loads(t.read_text()),sys.argv[4]=='true')))"
+                    owner.verify()
+                    inspected = owner.command("exec", profile["sandbox_name"], "--no-login-shell", "--no-tty", "--timeout", "60", "--", profile.get("python", "python3"), "-c", script, remote + "/coordinate.py", digest(payload["coordinate.py"]), digest(payload["task.json"]), "true" if reconcile_conversation else "false")
+                    if len(inspected.stdout.encode()) > 1024 * 1024:
+                        raise ValueError("Conversation inspection exceeds bound")
+                    inspection = json.loads(inspected.stdout)
+                    write_private_control(output / "conversation-inspection.json", inspection)
+                    receipt["inspection_sha256"] = digest((output / "conversation-inspection.json").read_bytes())
+                    checkpoint = inspection.get("checkpoint")
+                    if inspection.get("continuable") is True and (checkpoint == task["session"]["prior"] or receipt["evidence"].get("conversation_valid") is True and checkpoint == read_json(output / "results/conversation.json")):
+                        receipt.update(conversation_valid=True, continuation_checkpoint=checkpoint)
                 receipt["outcome"] = "recovered_" + receipt["evidence"]["evidence_status"]
             except BaseException as error:
                 receipt["error"] = str(error)
@@ -1366,6 +1785,9 @@ def recover_task(failed_directory, profile_file, output, lock_root):
                 cleanup_owner(owner, profile, receipt, protected)
                 receipt["ended_at"] = utc_now()
                 receipt["recovery_valid"] = receipt["cleanup_complete"] and receipt.get("protected_unchanged", False) and receipt.get("download_complete", False) and receipt.get("evidence", {}).get("available_bindings_valid", False)
+                if task.get("session"):
+                    receipt["recovery_valid"] = receipt["recovery_valid"] and "inspection_sha256" in receipt and "error" not in receipt
+                    receipt["conversation_valid"] = receipt["conversation_valid"] and receipt["recovery_valid"] and "error" not in receipt
                 save_journal()
                 write_new_json(output / "receipt.json", receipt)
     return receipt
@@ -1379,12 +1801,21 @@ def main(argv=None):
     run.add_argument("--profile", type=Path, default=Path.home() / ".config/codex-pi-coordination/profile.json")
     run.add_argument("--output", type=Path, required=True)
     run.add_argument("--lock-root", type=Path, default=Path.home() / ".local/state/codex-pi-coordination")
+    run.add_argument("--save-session", action="store_true")
+    continuation = sub.add_parser("continue", help="Assign a fresh task to an exact saved Pi conversation")
+    continuation.add_argument("task", type=Path)
+    continuation.add_argument("--from", dest="previous_directory", type=Path, required=True)
+    continuation.add_argument("--profile", type=Path, default=Path.home() / ".config/codex-pi-coordination/profile.json")
+    continuation.add_argument("--output", type=Path, required=True)
+    continuation.add_argument("--lock-root", type=Path, default=Path.home() / ".local/state/codex-pi-coordination")
     configure = sub.add_parser("configure", help="Register an existing private profile as the default, without replacing one")
     configure.add_argument("--profile", type=Path, required=True)
     capabilities = sub.add_parser("capabilities", help="Inspect sanitized model capabilities without sending a prompt")
     capabilities.add_argument("--profile", type=Path, default=Path.home() / ".config/codex-pi-coordination/profile.json")
     capabilities.add_argument("--output", type=Path, required=True)
     capabilities.add_argument("--lock-root", type=Path, default=Path.home() / ".local/state/codex-pi-coordination")
+    capabilities.add_argument("--provider")
+    capabilities.add_argument("--model")
     recover = sub.add_parser("recover", help="Download evidence from the latest stopped failed run without rerunning it")
     recover.add_argument("failed_directory", type=Path)
     recover.add_argument("--profile", type=Path, default=Path.home() / ".config/codex-pi-coordination/profile.json")
@@ -1395,18 +1826,29 @@ def main(argv=None):
     reconcile = sub.add_parser("reconcile", help="Reconcile unresolved custody only after the exact sandbox is Stopped")
     reconcile.add_argument("--profile", type=Path, default=Path.home() / ".config/codex-pi-coordination/profile.json")
     reconcile.add_argument("--lock-root", type=Path, default=Path.home() / ".local/state/codex-pi-coordination")
+    reconcile.add_argument("--from", dest="failed_directory", type=Path)
+    reconcile.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     try:
         if args.operation == "configure":
             print(json.dumps(configure_profile(args.profile)))
             return 0
         if args.operation == "capabilities":
-            receipt = run_task(None, args.profile, args.output, args.lock_root, capabilities_only=True)
+            selected = None
+            if args.provider is not None or args.model is not None:
+                selected = {"provider": model_identifier(args.provider), "model": model_identifier(args.model)}
+            receipt = run_task(None, args.profile, args.output, args.lock_root, capabilities_only=True, selected_model=selected)
             print(json.dumps({"run_id": receipt["run_id"], "capabilities_valid": receipt["capabilities_valid"], "delivery_valid": False, "acceptance": "not_granted", "receipt": str(args.output / "receipt.json")}))
             return 0 if receipt["capabilities_valid"] else 1
         if args.operation == "worker":
             return worker(args.root)
         if args.operation == "reconcile":
+            if args.failed_directory is not None or args.output is not None:
+                if args.failed_directory is None or args.output is None:
+                    raise ValueError("Conversation reconciliation requires --from and --output together")
+                receipt = recover_task(args.failed_directory, args.profile, args.output, args.lock_root, reconcile_conversation=True)
+                print(json.dumps({"recovery_valid": receipt["recovery_valid"], "conversation_valid": receipt.get("conversation_valid", False), "delivery_valid": False, "acceptance": "not_granted", "receipt": str(args.output / "receipt.json")}))
+                return 0 if receipt["recovery_valid"] else 1
             profile = profile_settings(args.profile)
             with exclusive_owner(profile, args.lock_root) as journal:
                 prior = read_json(journal)
@@ -1420,9 +1862,9 @@ def main(argv=None):
             return 0
         if args.operation == "recover":
             receipt = recover_task(args.failed_directory, args.profile, args.output, args.lock_root)
-            print(json.dumps({"run_id": receipt["run_id"], "failed_run_id": receipt["failed_run_id"], "outcome": receipt["outcome"], "recovery_valid": receipt["recovery_valid"], "task_delivery_valid": False, "acceptance": "not_granted", "receipt": str(args.output / "receipt.json")}))
+            print(json.dumps({"run_id": receipt["run_id"], "failed_run_id": receipt["failed_run_id"], "outcome": receipt["outcome"], "recovery_valid": receipt["recovery_valid"], **({"conversation_valid": receipt["conversation_valid"]} if "conversation_valid" in receipt else {}), "task_delivery_valid": False, "acceptance": "not_granted", "receipt": str(args.output / "receipt.json")}))
             return 0 if receipt["recovery_valid"] else 1
-        receipt = run_task(args.task, args.profile, args.output, args.lock_root)
+        receipt = run_task(args.task, args.profile, args.output, args.lock_root, save_session=getattr(args, "save_session", False), previous_directory=getattr(args, "previous_directory", None))
         print(json.dumps({"run_id": receipt["run_id"], "outcome": receipt["outcome"], "delivery_valid": receipt["delivery_valid"], "receipt": str(args.output / "receipt.json")}))
         return 0 if receipt["delivery_valid"] else 1
     except (OSError, ValueError, tarfile.TarError, subprocess.SubprocessError) as error:

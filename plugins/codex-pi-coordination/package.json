@@ -1,7 +1,7 @@
 {
   "name": "codex-pi-coordination",
-  "version": "0.2.0",
-  "description": "Bounded Pi task handoff for an external Codex coordinator",
+  "version": "0.3.0",
+  "description": "Bounded Pi tasks, saved-session continuation and capability discovery for Codex",
   "type": "module",
   "license": "MIT",
   "engines": { "node": ">=22" },

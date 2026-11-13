@@ -32,9 +32,10 @@ assert tools == set(task['allowed_tools']) | {'coordination_status','coordinatio
 counter=task_path.parent/'invocations.txt'
 counter.write_text(counter.read_text()+'1' if counter.exists() else '1')
 changed=[]
-if behavior in ('change','out-scope'):
+if behavior in ('change','out-scope') or behavior.startswith('saved-'):
     name='answer.txt' if behavior=='change' else 'unapproved.txt'
-    (workspace/name).write_text('after\n'); changed=[name]
+    if behavior.startswith('saved-'): name='answer.txt'
+    (workspace/name).write_text(task['instructions']+'\n' if behavior.startswith('saved-') else 'after\n'); changed=[name]
 report={'run_id':task['run_id'],'task_id':task['task_id'],'task_sha256':hashlib.sha256(task_path.read_bytes()).hexdigest(),'model_self_report':True,'status':'blocked' if behavior=='blocked' else 'completed','changed_files':changed,'summary':'Synthetic handoff','evidence':[],'limitations':[]}
 if behavior=='wrong-identity': report['run_id']='different-run'
 if behavior=='wrong-digest': report['task_sha256']='0'*64
@@ -48,9 +49,9 @@ if behavior in ('pre-guard-error','unguarded-success'):
     events[:0]=[{'type':'tool_execution_start','toolCallId':'schema-attempt','toolName':'coordination_handoff'},{'type':'tool_execution_end','toolCallId':'schema-attempt','isError':behavior=='pre-guard-error'}]
 task_digest=hashlib.sha256(task_path.read_bytes()).hexdigest()
 def extension_event(kind, calls=1, turns=1, handed_off=True, **fields):
-    return {'type':kind,'at':'2000-01-01T00:00:00Z','active':True,'run_id':task['run_id'],'task_id':task['task_id'],'task_sha256':task_digest,'tool_calls':calls,'turns':turns,'handed_off':handed_off,**fields}
+    return {'type':kind,'at':'2000-01-01T00:00:00Z','active':True,'run_id':task['run_id'],'task_id':task['task_id'],'task_sha256':task_digest,'tool_calls':calls,'turns':turns,'handed_off':handed_off,**({'session':rpc_saved_identity} if task['version']==3 else {}),**fields}
 extension_events=[extension_event('task_loaded',0,0,False),extension_event('tool_call',handed_off=False,tool_name='coordination_handoff',tool_call_id='call-1'),extension_event('handoff',reported_status=report['status']),extension_event('agent_settled'),extension_event('session_shutdown')]
-if task['version']==2:
+if task['version'] in (2,3):
     extension_events.insert(1,extension_event('run_configuration',0,0,False,configuration=rpc_effective))
 if behavior=='extension-refused': extension_events.insert(3,extension_event('refused',failure={'code':'task_unavailable','message':'No further tools'},code='task_unavailable'))
 if behavior=='extension-failure': extension_events[-1]['failure']={'code':'tool_budget_exhausted','message':'Budget exhausted'}
@@ -74,18 +75,44 @@ raise SystemExit(7 if behavior=='exit-seven' else 0)
 '''
 
 FAKE_RPC = 'PRINT_FIXTURE = ' + repr(FAKE_PI) + '\n' + r'''
-import json, pathlib, sys, os
+import json, pathlib, sys, os, uuid
 behavior = sys.argv[1]
 requests_file = pathlib.Path(__file__).with_suffix('.requests.jsonl')
 model = {'provider':'example','id':'model','headers':{'Authorization':'synthetic-private-marker'},'baseUrl':'https://synthetic.invalid/private'}
 thinking = 'high'
 levels = ['off','minimal','low','medium','high','xhigh','max']
 if behavior=='off-only': thinking='off';levels=['off']
+session_path = pathlib.Path(sys.argv[sys.argv.index('--session')+1]) if '--session' in sys.argv else None
+session_id = 'session-one'
+entries = []
+if session_path:
+    assert '--no-session' not in sys.argv
+    assert str(session_path.parent) == sys.argv[sys.argv.index('--session-dir')+1]
+    if session_path.exists():
+        entries = [json.loads(line) for line in session_path.read_text().splitlines()]
+        assert entries[0]['cwd'] == os.getcwd()
+        for entry in entries[1:]:
+            if entry['type']=='model_change': model={'provider':entry['provider'],'id':entry['modelId']}
+            if entry['type']=='thinking_level_change': thinking=entry['thinkingLevel']
+    else:
+        entries=[{'type':'session','version':3,'id':str(uuid.uuid4()),'timestamp':'2000-01-01T00:00:00Z','cwd':os.getcwd()}]
+    session_id=entries[0]['id']
+    assert not session_path.exists() or session_path.stat().st_size
+def persist_entry(kind, **fields):
+    if not session_path: return
+    entry={'type':kind,'id':uuid.uuid4().hex[:8],'parentId':entries[-1].get('id') if len(entries)>1 else None,'timestamp':'2000-01-01T00:00:00Z',**fields}
+    entries.append(entry)
+    if session_path.exists():
+        with session_path.open('a') as stream: stream.write(json.dumps(entry)+'\n')
+    elif any(item.get('message',{}).get('role')=='assistant' for item in entries):
+        with session_path.open('x') as stream:
+            for item in entries: stream.write(json.dumps(item)+'\n')
 held = None
 def change_thinking(level):
     global thinking
     if level == thinking: return
     thinking = level
+    persist_entry('thinking_level_change',thinkingLevel=level)
     event={'type':'thinking_level_changed','level':level,'private_metadata':'synthetic-private-marker'}
     if behavior=='malformed-configuration': event['level']=[]
     if behavior=='agent-before-prompt': event={'type':'agent_start'}
@@ -113,24 +140,34 @@ for line in sys.stdin:
     if command=='get_available_models':
         if behavior=='unsolicited-configuration': print(json.dumps({'type':'thinking_level_changed','level':'low'}),flush=True)
         data={'models':[model,{'provider':'second','id':'model-two','headers':{'secret':'synthetic-private-marker'}}]}
-        if behavior=='out-of-order': held=(request,data);continue
+        if behavior=='selected-duplicate-model': data['models'].append(dict(data['models'][1]))
+        if behavior in ('out-of-order','selected-out-of-order'): held=(request,data);continue
     elif command=='get_state':
-        data={'model':model,'thinkingLevel':thinking,'sessionId':'session-one','sessionFile':None,'isStreaming':False,'isCompacting':False,'pendingMessageCount':0}
+        data={'model':model,'thinkingLevel':thinking,'sessionId':session_id,'sessionFile':str(session_path) if session_path else None,'isStreaming':False,'isCompacting':False,'pendingMessageCount':0}
         if behavior=='busy': data['pendingMessageCount']=1
+        if behavior=='saved-wrong-id': data['sessionId']='foreign-session'
+        if behavior=='selected-wrong-model' and model['provider']=='second': data['model']={'provider':'foreign','id':'model'}
+        if behavior=='selected-wrong-level' and model['provider']=='second': data['thinkingLevel']='high'
     elif command=='get_available_thinking_levels': data={'levels':['low'] if behavior=='only-low' else levels}
     elif command=='set_model':
         model={'provider':request['provider'],'id':request['modelId']};data=model
-        change_thinking('low')
+        persist_entry('model_change',provider=model['provider'],modelId=model['id'])
+        if behavior.startswith('selected-') and model['provider']=='second':
+            levels=['off'];change_thinking('off')
+        else: change_thinking('low')
     elif command=='set_thinking_level':
         change_thinking('low' if behavior=='clamped' else request['level']);data=None
     elif command=='prompt':
         if behavior=='no-prompt-ack': continue
         reply(request)
-        namespace={'rpc_effective':{'provider':model['provider'],'model':model['id'],'thinking':thinking}}
+        namespace={'rpc_effective':{'provider':model['provider'],'model':model['id'],'thinking':thinking},'rpc_saved_identity':{'id':session_id,'file':str(session_path),'cwd':os.getcwd(),'version':3}}
         try: exec(PRINT_FIXTURE,namespace)
         except SystemExit as result:
             if result.code: raise
-        if behavior!='no-settlement': print(json.dumps({'type':'agent_settled'}),flush=True)
+        persist_entry('message',message={'role':'assistant','content':[{'type':'text','text':'Synthetic completed dispatch'}]})
+        if behavior=='saved-partial-tail':
+            with session_path.open('a') as stream: stream.write('{')
+        if behavior not in ('no-settlement','saved-no-settlement'): print(json.dumps({'type':'agent_settled'}),flush=True)
         continue
     else: raise AssertionError(command)
     reply(request,data)
@@ -182,6 +219,53 @@ console.log(JSON.stringify(cases.map(item => { try { loadTask(item.task, item.cw
 
 
 class ContractTests(unittest.TestCase):
+    def test_selected_metadata_requires_paired_valid_flags_before_owner(self):
+        for flags in (["--provider", "example"], ["--model", "model"], ["--provider", "bad provider", "--model", "model"]):
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as directory, mock.patch.object(coordinate, "OpenShellOwner") as owner, contextlib.redirect_stderr(io.StringIO()):
+                output = Path(directory) / "output"
+                self.assertEqual(coordinate.main(["capabilities", "--output", str(output), *flags]), 1)
+                owner.assert_not_called()
+                self.assertFalse(output.exists())
+
+    def test_relative_path_utf16_boundary_matches_native_loader_before_owner(self):
+        ascii_prefix = ("a" * 200 + "/") * 5
+        astral_prefix = ("\U0001f600" * 50 + "/") * 10
+        paths = [(ascii_prefix + "b" * 19, True), (ascii_prefix + "b" * 20, False),
+                 (astral_prefix + "b" * 14, True), (astral_prefix + "b" * 15, False),
+                 ("bad\ud800.txt", False), ("bad\udfff.txt", False)]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"; workspace.mkdir()
+            output = root / "results"; output.mkdir()
+            cases = []
+            for version in (1, 2, 3):
+                if version == 3:
+                    dispatch = root / "remote" / ("a" * 32)
+                    workspace = root / "remote/conversations" / ("a" * 32) / "workspace"
+                    output = dispatch / "results"
+                    workspace.mkdir(parents=True); output.mkdir(parents=True)
+                for path, expected in paths:
+                    public = {**task_template(), "version": min(version, 2), "writable_paths": [path]}
+                    task_path = root / f"public-{len(cases)}.json"; dump(task_path, public)
+                    if expected:
+                        self.assertEqual(coordinate.validate_task(public), public)
+                        (workspace / path).parent.mkdir(parents=True, exist_ok=True)
+                    else:
+                        with self.assertRaises(ValueError): coordinate.validate_task(public)
+                        with mock.patch.object(coordinate, "OpenShellOwner") as owner, contextlib.redirect_stderr(io.StringIO()):
+                            self.assertEqual(coordinate.main(["run", str(task_path), "--profile", str(root / "absent-profile"), "--output", str(root / "absent-output")]), 1)
+                            owner.assert_not_called()
+                        self.assertFalse((root / "absent-output").exists())
+                    native = {**public, "run_id": "run-one", "workspace": str(workspace), "output_directory": str(output), "allowed_tools": ["read", "write"], "max_tool_calls": 8}
+                    if version in (2, 3):
+                        native.update(operation="run", run_options={}, runtime_defaults={"model": "example/model", "thinking": "high"})
+                    if version == 3:
+                        native.update(version=3, run_id="a" * 32, session={"conversation_id": "a" * 32, "directory": str(workspace.parent), "file": str(workspace.parent / "session.jsonl"), "prior": None, "prior_sha256": None})
+                    native_path = (dispatch if version == 3 else root) / f"native-{len(cases)}.json"; dump(native_path, native)
+                    cases.append({"task": str(native_path), "cwd": str(workspace), "expected": expected})
+            self.assertEqual(native_extension_load_results(cases), [case["expected"] for case in cases])
+            self.assertEqual(list(output.iterdir()), [])
+
     def test_python_versioned_task_boundary_matches_actual_extension(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -710,6 +794,53 @@ class RpcTests(unittest.TestCase):
         path = root / "fake-pi.requests.jsonl"
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
+    def test_selected_metadata_queries_off_only_model_without_thinking_setter(self):
+        for behavior in ('selected-off', 'selected-out-of-order'):
+            root = self.prepare(name=behavior, behavior=behavior, metadata=True)
+            task = coordinate.read_json(root / "task.json")
+            task.update(version=3, operation="capabilities_selected", selected_model={"provider": "second", "model": "model-two"})
+            task["runtime_defaults"]["thinking"] = "low"; dump(root / "task.json", task)
+            before = coordinate.snapshot(root / "workspace")
+            self.assertEqual(coordinate.worker(root), 0)
+            receipt = coordinate.verify_return(root / "results", task, before, "run-one")
+            configuration = receipt["configuration"]
+            self.assertEqual(configuration["effective"], {"provider": "second", "model": "model-two", "thinking": "off"})
+            self.assertEqual(configuration["supported_thinking_levels"], ["off"])
+            self.assertFalse(configuration["profile_default_supported"])
+            self.assertEqual(configuration["requested"], task["selected_model"])
+            self.assertEqual([r["type"] for r in self.requests(root)], ["get_available_models", "get_state", "set_model", "get_available_thinking_levels", "get_state"])
+            self.assertEqual(coordinate.snapshot(root / "workspace"), before)
+            self.assertFalse((root / "results/extension-events.jsonl").exists())
+            self.assertEqual((root / "results/pi-events.jsonl").read_bytes(), b"")
+
+    def test_selected_metadata_refuses_catalog_readback_and_resealed_evidence(self):
+        for behavior in ('selected-duplicate-model', 'selected-wrong-model', 'selected-wrong-level', 'refused', 'selected-absent-model'):
+            root = self.prepare(name=behavior, behavior=behavior, metadata=True)
+            task = coordinate.read_json(root / "task.json")
+            task.update(version=3, operation="capabilities_selected", selected_model={"provider": "absent" if behavior == 'selected-absent-model' else "second", "model": "model-two"})
+            dump(root / "task.json", task)
+            self.assertEqual(coordinate.worker(root), 1)
+            self.assertFalse(any(r['type'] in ('prompt', 'set_thinking_level') for r in self.requests(root)))
+        root = self.prepare(name="resealed-selected", behavior="selected-off", metadata=True)
+        task = coordinate.read_json(root / "task.json")
+        task.update(version=3, operation="capabilities_selected", selected_model={"provider": "second", "model": "model-two"})
+        dump(root / "task.json", task)
+        self.assertEqual(coordinate.worker(root), 0)
+        output = root / "results"
+        configuration = coordinate.read_json(output / "rpc-configuration.json")
+        configuration["profile_default_supported"] = True; dump(output / "rpc-configuration.json", configuration)
+        receipt = coordinate.read_json(output / "worker-receipt.json")
+        receipt["configuration"] = configuration
+        receipt["artifact_sha256"] = {name: coordinate.digest(raw) for name, raw in coordinate.snapshot(output).items() if name != "worker-receipt.json"}
+        dump(output / "worker-receipt.json", receipt)
+        with self.assertRaises(ValueError): coordinate.verify_return(output, task, {"answer.txt": b"before\n"}, "run-one")
+
+    def test_off_only_selected_run_requires_explicit_supported_thinking(self):
+        for thinking in ('low', 'off'):
+            root = self.prepare(name=thinking, behavior="selected-off", options={"provider": "second", "model": "model-two", "thinking": thinking})
+            self.assertEqual(coordinate.worker(root), 0 if thinking == 'off' else 1)
+            self.assertEqual(sum(r['type'] == 'prompt' for r in self.requests(root)), 1 if thinking == 'off' else 0)
+
     def test_default_and_exact_overrides_return_real_changes_with_private_metadata_removed(self):
         for index, options in enumerate([{}, {"thinking": "low"}, {"provider": "second", "model": "model-two", "thinking": "max"}]):
             with self.subTest(options=options):
@@ -973,6 +1104,8 @@ class OwnerTests(unittest.TestCase):
                 super().__init__(profile)
                 self.state = {"id": "sandbox-id", "name": "disposable", "phase": "Stopped", "main_process_instance_id": "old", "restart_count": 0}
                 self.calls = []; test.instances.append(self)
+                if mode == "persistent" and hasattr(test, "last_owner_state"):
+                    self.state = copy.deepcopy(test.last_owner_state)
                 if mode == "initial-wrong-id": self.state["id"] = "other"
                 if mode == "initial-ready": self.state["phase"] = "Ready"
                 if mode == "reconciled": self.state["main_process_instance_id"] = "new-main"
@@ -985,13 +1118,14 @@ class OwnerTests(unittest.TestCase):
                 if args[0] == "start":
                     if mode == "start-no-change-error": raise subprocess.CalledProcessError(1, "synthetic unchanged start")
                     self.state.update(phase="Ready", main_process_instance_id="new-main")
+                    if mode == "persistent": self.state["main_process_instance_id"] += "-" + str(len(test.instances))
                     if mode == "start-error": raise subprocess.CalledProcessError(1, "synthetic start")
                 elif args[0] == "upload":
                     shutil.copyfile(args[-2], args[-1])
                     if mode == "replaced-after-upload": self.state["main_process_instance_id"] = "replacement"
                 elif args[0] == "exec":
                     if mode == "exec-error": raise subprocess.CalledProcessError(1, "synthetic exec")
-                    subprocess.run(list(args[args.index("--") + 1:]), check=True, capture_output=True, timeout=timeout)
+                    return subprocess.run(list(args[args.index("--") + 1:]), check=True, capture_output=True, text=True, timeout=timeout)
                 elif args[0] == "download":
                     if self.state["phase"] != "Ready":
                         raise subprocess.CalledProcessError(1, "download requires running sandbox")
@@ -1004,6 +1138,7 @@ class OwnerTests(unittest.TestCase):
                 elif args[0] == "stop":
                     if mode == "stop-error": raise subprocess.CalledProcessError(1, "synthetic stop")
                     self.state["phase"] = "Stopped"
+                    if mode == "persistent": test.last_owner_state = copy.deepcopy(self.state)
                 else: raise AssertionError(args)
                 return subprocess.CompletedProcess(args, 0, "", "")
         return FakeOwner
@@ -1511,6 +1646,277 @@ class RecoveryTests(unittest.TestCase):
         summary = json.loads(stdout.getvalue())
         self.assertEqual(code, 0); self.assertTrue(summary['recovery_valid']); self.assertFalse(summary['task_delivery_valid'])
         self.assertEqual(summary['acceptance'], 'not_granted')
+
+
+class SavedConversationTests(unittest.TestCase):
+    factory = OwnerTests.factory
+
+    def setUp(self):
+        OwnerTests.setUp(self)
+        self.profile["pi_argv"][-1] = "saved-edit"
+        dump(self.profile_path, self.profile)
+        self.repository = self.root / "repository"; self.repository.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=self.repository, check=True, timeout=10)
+        (self.repository / "answer.txt").write_text("before\n")
+        self.commit()
+        self.owner_patch = mock.patch.object(coordinate, "OpenShellOwner", self.factory("persistent"))
+        self.owner_patch.start(); self.addCleanup(self.owner_patch.stop)
+        self.stdout = contextlib.redirect_stdout(io.StringIO()); self.stdout.__enter__()
+        self.addCleanup(self.stdout.__exit__, None, None, None)
+
+    def commit(self):
+        subprocess.run(["git", "add", "--all"], cwd=self.repository, check=True, timeout=10)
+        subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "Fixture revision"], cwd=self.repository, check=True, timeout=10)
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repository, text=True, timeout=10).strip()
+
+    def assignment(self, text, *, checks=None):
+        revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repository, text=True, timeout=10).strip()
+        task = {**task_template(), "version": 2, "task_id": "project:T001", "instructions": text, "writable_paths": ["answer.txt"], "repository": str(self.repository), "revision": revision, "run_options": {"thinking": "low"}, "checks": checks or [{"name": "verify", "argv": [sys.executable, "-c", "from pathlib import Path; assert Path('answer.txt').read_text()==" + repr(text + '\n') + "; Path('check-created.txt').write_text('retained')"], "timeout_seconds": 5}]}
+        dump(self.task_path, task)
+        return task
+
+    def test_saved_run_then_new_source_continue_keeps_official_id_and_history(self):
+        first_task = self.assignment("first edit")
+        first = coordinate.run_task(self.task_path, self.profile_path, self.root / "first", self.root / "locks", save_session=True)
+        self.assertTrue(first["delivery_valid"], first)
+        checkpoint = coordinate.read_json(self.root / "first/results/conversation.json")
+        session_path = Path(checkpoint["session"]["file"])
+        before_session = session_path.read_bytes()
+        before_artifacts = coordinate.snapshot(self.root / "first")
+        self.assertIn("check-created.txt", checkpoint["workspace"]["files"])
+        metadata = coordinate.run_task(None, self.profile_path, self.root / "metadata", self.root / "locks", capabilities_only=True, selected_model={"provider": "second", "model": "model-two"})
+        self.assertTrue(metadata["capabilities_valid"], metadata)
+        self.assertEqual(session_path.read_bytes(), before_session)
+        (self.repository / "answer.txt").write_bytes((self.root / "first/results/changed-files/answer.txt").read_bytes())
+        self.commit(); second_task = self.assignment("second edit")
+        self.assertNotEqual(first_task["revision"], second_task["revision"])
+        second = coordinate.run_task(self.task_path, self.profile_path, self.root / "second", self.root / "locks", previous_directory=self.root / "first")
+        self.assertTrue(second["delivery_valid"], second)
+        second_checkpoint = coordinate.read_json(self.root / "second/results/conversation.json")
+        self.assertEqual(second_checkpoint["session"]["id"], checkpoint["session"]["id"])
+        self.assertEqual(second_checkpoint["session"]["file"], str(session_path))
+        self.assertTrue(session_path.read_bytes().startswith(before_session))
+        self.assertGreater(len(session_path.read_bytes()), len(before_session))
+        self.assertEqual((self.root / "second/results/changed-files/answer.txt").read_bytes(), b"second edit\n")
+        self.assertEqual(coordinate.snapshot(self.root / "first"), before_artifacts)
+        self.assertTrue(all(instance.calls.count("start") == instance.calls.count("stop") == 1 for instance in self.instances))
+        self.assertEqual(second["acceptance"], "not_granted")
+        stale = coordinate.run_task(self.task_path, self.profile_path, self.root / "stale", self.root / "locks", previous_directory=self.root / "first")
+        self.assertFalse(stale["delivery_valid"])
+        stale_remote = Path(stale["remote_artifacts"]).parent
+        self.assertFalse((stale_remote / "invocations.txt").exists())
+        self.assertIn("Stale or duplicate", coordinate.read_json(stale_remote / "results/worker-receipt.json")["error"])
+        self.assertEqual(coordinate.snapshot(self.root / "first"), before_artifacts)
+
+    def first_saved(self, *, checks=None):
+        self.assignment("first edit", checks=checks)
+        first = coordinate.run_task(self.task_path, self.profile_path, self.root / "first", self.root / "locks", save_session=True)
+        remote = Path(first["remote_artifacts"]).parent
+        return first, remote, coordinate.read_json(remote / "task.json")
+
+    def test_failed_checks_recover_advanced_conversation_without_replay(self):
+        failed, remote, native = self.first_saved(checks=[{"name": "failing", "argv": [sys.executable, "-c", "raise SystemExit(7)"], "timeout_seconds": 5}])
+        self.assertFalse(failed["delivery_valid"])
+        self.assertTrue(failed["cleanup_complete"])
+        prior_bytes = coordinate.snapshot(self.root / "first")
+        with self.assertRaisesRegex(ValueError, "Recover the failed"):
+            coordinate.run_task(self.task_path, self.profile_path, self.root / "forbidden", self.root / "locks", previous_directory=self.root / "first")
+        coordinate.run_task(None, self.profile_path, self.root / "metadata", self.root / "locks", capabilities_only=True)
+        recovered = coordinate.recover_task(self.root / "first", self.profile_path, self.root / "recovered", self.root / "locks")
+        self.assertTrue(recovered["recovery_valid"], recovered)
+        self.assertTrue(recovered["conversation_valid"], recovered)
+        self.assertFalse(recovered["task_delivery_valid"])
+        self.assertEqual(recovered["evidence"]["checks"][0]["exit_code"], 7)
+        self.assertEqual((remote / "invocations.txt").read_text(), "1")
+        self.assertEqual(coordinate.snapshot(self.root / "first"), prior_bytes)
+        (self.repository / "answer.txt").write_text("first edit\n"); self.commit()
+        self.assignment("second edit")
+        second = coordinate.run_task(self.task_path, self.profile_path, self.root / "second", self.root / "locks", previous_directory=self.root / "recovered")
+        self.assertTrue(second["delivery_valid"], second)
+        self.assertEqual(second["worker"]["conversation"]["session_after"]["id"], recovered["continuation_checkpoint"]["session"]["id"])
+
+    def test_session_and_full_workspace_drift_refuse_without_prompt(self):
+        first, remote, native = self.first_saved()
+        self.assertTrue(first["delivery_valid"], first)
+        session = Path(native["session"]["file"]); original = session.read_bytes()
+        header = json.loads(original.splitlines()[0])
+        variants = [b"", original[:-1], b"{invalid}\n", json.dumps(header).encode() + b"\n", json.dumps({**header, "version": 2}).encode() + b"\n", json.dumps({**header, "cwd": "/foreign"}).encode() + b"\n", original + b'{"type":"message","id":"orphan","parentId":"missing"}\n']
+        for index, raw in enumerate(variants):
+            with self.subTest(index=index):
+                session.write_bytes(raw)
+                refused = coordinate.run_task(self.task_path, self.profile_path, self.root / f"bad-{index}", self.root / "locks", previous_directory=self.root / "first")
+                self.assertFalse(refused["delivery_valid"])
+                self.assertTrue(refused["cleanup_complete"])
+                self.assertFalse((Path(refused["remote_artifacts"]).parent / "invocations.txt").exists())
+        session.write_bytes(original)
+        session.unlink()
+        refused = coordinate.run_task(self.task_path, self.profile_path, self.root / "missing", self.root / "locks", previous_directory=self.root / "first")
+        self.assertFalse(refused["delivery_valid"])
+        self.assertFalse(session.exists())
+        self.assertFalse((Path(refused["remote_artifacts"]).parent / "invocations.txt").exists())
+        session.write_bytes(original)
+        session.unlink(); session.symlink_to(remote / "task.json")
+        with self.assertRaisesRegex(ValueError, "symbolic link"):
+            coordinate.run_task(self.task_path, self.profile_path, self.root / "linked", self.root / "locks", previous_directory=self.root / "first")
+        session.unlink(); session.write_bytes(original)
+        created = Path(native["workspace"]) / "check-created.txt"
+        original_mode = created.stat().st_mode & 0o777
+        for index, change in enumerate((lambda: created.write_text("changed"), lambda: created.chmod(original_mode ^ 0o100))):
+            change()
+            refused = coordinate.run_task(self.task_path, self.profile_path, self.root / f"workspace-{index}", self.root / "locks", previous_directory=self.root / "first")
+            self.assertFalse(refused["delivery_valid"])
+            self.assertFalse((Path(refused["remote_artifacts"]).parent / "invocations.txt").exists())
+            created.write_text("retained"); created.chmod(original_mode)
+
+    def test_interrupted_workspace_transitions_are_inspected_without_rollback(self):
+        first, first_remote, native = self.first_saved()
+        self.assertTrue(first["delivery_valid"], first)
+        prior = coordinate.read_json(first_remote / "results/conversation.json")
+        original_tree = coordinate.workspace_manifest(Path(native["workspace"]))
+        # Separate isolated copies exercise each rename boundary without replaying Pi.
+        for boundary in (0, 1, 2):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as directory:
+                parent = Path(directory) / "remote"; parent.mkdir()
+                run_id = "b" * 32; conversation_id = native["session"]["conversation_id"]
+                dispatch = parent / run_id; (dispatch / "workspace").mkdir(parents=True)
+                (dispatch / "workspace/answer.txt").write_text("new source\n")
+                conversation = parent / "conversations" / conversation_id
+                shutil.copytree(Path(native["session"]["directory"]), conversation)
+                workspace = conversation / "workspace"
+                history = (conversation / "session.jsonl").read_bytes().splitlines()
+                header = json.loads(history[0]); header["cwd"] = str(workspace)
+                (conversation / "session.jsonl").write_bytes(json.dumps(header).encode() + b"\n" + b"\n".join(history[1:]) + b"\n")
+                checkpoint = copy.deepcopy(prior); checkpoint["session"] = coordinate.saved_session_snapshot(conversation / "session.jsonl", workspace)
+                (conversation / "checkpoint.json").write_bytes(coordinate.private_control_bytes(checkpoint))
+                task = {**native, "run_id": run_id, "operation": "continue", "workspace": str(workspace), "output_directory": str(dispatch / "results"), "session": {"conversation_id": conversation_id, "directory": str(conversation), "file": str(conversation / "session.jsonl"), "prior": checkpoint, "prior_sha256": coordinate.digest(coordinate.private_control_bytes(checkpoint))}}
+                manifest = coordinate.workspace_manifest(dispatch / "workspace")
+                task["source"] = {**native["source"], "files": {k: v["sha256"] for k, v in manifest["files"].items()}, "modes": {k: v["mode"] for k, v in manifest["files"].items()}}
+                (dispatch / "task.json").write_bytes(json.dumps(task).encode())
+                real_rename = Path.rename; renamed = []
+                def interrupt_rename(path, target):
+                    if len(renamed) == boundary: raise OSError("Synthetic rename interruption")
+                    result = real_rename(path, target); renamed.append(str(path)); return result
+                with mock.patch.object(Path, "rename", interrupt_rename):
+                    if boundary < 2:
+                        with self.assertRaises(OSError): coordinate.prepare_saved_workspace(dispatch, task)
+                    else:
+                        coordinate.prepare_saved_workspace(dispatch, task)
+                self.assertTrue((conversation / "pending.json").is_file())
+                if boundary == 0:
+                    observed = coordinate.inspect_saved_conversation(dispatch, task)
+                    self.assertFalse(observed["continuable"])
+                    reconciled = coordinate.inspect_saved_conversation(dispatch, task, reconcile=True)
+                    self.assertTrue(reconciled["continuable"])
+                    self.assertEqual(coordinate.workspace_manifest(workspace), original_tree)
+                    self.assertTrue((dispatch / "transition-reconciled.json").is_file())
+                elif boundary == 1:
+                    with self.assertRaises((ValueError, FileNotFoundError)): coordinate.inspect_saved_conversation(dispatch, task, reconcile=True)
+                    self.assertFalse(workspace.exists())
+                else:
+                    observed = coordinate.inspect_saved_conversation(dispatch, task, reconcile=True)
+                    self.assertFalse(observed["continuable"])
+                    self.assertEqual(observed["disposition"], "new_workspace_dispatch_unresolved")
+                    self.assertEqual((workspace / "answer.txt").read_text(), "new source\n")
+                    self.assertTrue((conversation / "pending.json").is_file())
+
+    def test_saved_controls_and_storage_limits_never_truncate(self):
+        first, remote, native = self.first_saved()
+        self.assertTrue(first["delivery_valid"], first)
+        session = Path(native["session"]["file"]); raw = session.read_bytes()
+        with mock.patch.object(coordinate, "MAX_SESSION_BYTES", len(raw) - 1), self.assertRaisesRegex(ValueError, "bounded regular"):
+            coordinate.saved_session_snapshot(session, Path(native["workspace"]))
+        with mock.patch.object(coordinate, "MAX_RETAINED_BYTES", 1), self.assertRaisesRegex(ValueError, "1 GiB"):
+            coordinate.retained_storage_guard(remote.parent)
+        self.assertEqual(session.read_bytes(), raw)
+        with self.assertRaisesRegex(ValueError, "1 MiB"):
+            coordinate.private_control_bytes({"too_large": "x" * (1024 * 1024)})
+        with self.assertRaisesRegex(ValueError, "Unknown native"):
+            coordinate.validate_native_task({**native, "version": 4})
+
+    def test_reconcile_command_certifies_unchanged_old_checkpoint_without_replay(self):
+        first, first_remote, native = self.first_saved()
+        self.assertTrue(first["delivery_valid"], first)
+        stable = Path(native["workspace"])
+        session_before = Path(native["session"]["file"]).read_bytes()
+        self.assignment("second edit")
+        execute = coordinate.execute_to_log
+        def interrupted_worker(argv, cwd, log, timeout, **options):
+            if "worker" not in argv:
+                return execute(argv, cwd, log, timeout, **options)
+            Path(log).write_bytes(b"Synthetic pre-rename interruption\n")
+            rename = Path.rename
+            def refuse_first_rename(path, destination):
+                if path == stable: raise OSError("Synthetic before-first-rename interruption")
+                return rename(path, destination)
+            with mock.patch.object(Path, "rename", refuse_first_rename):
+                return coordinate.worker(Path(argv[-1]))
+        with mock.patch.object(coordinate, "execute_to_log", interrupted_worker):
+            failed = coordinate.run_task(self.task_path, self.profile_path, self.root / "failed", self.root / "locks", previous_directory=self.root / "first")
+        self.assertFalse(failed["delivery_valid"])
+        failed_remote = Path(failed["remote_artifacts"]).parent
+        self.assertFalse((failed_remote / "invocations.txt").exists())
+        original_artifacts = coordinate.snapshot(self.root / "failed")
+        self.assertEqual(coordinate.main(["reconcile", "--from", str(self.root / "failed"), "--output", str(self.root / "reconciled"), "--profile", str(self.profile_path), "--lock-root", str(self.root / "locks")]), 0)
+        recovery = coordinate.read_json(self.root / "reconciled/receipt.json")
+        self.assertTrue(recovery["recovery_valid"], recovery)
+        self.assertTrue(recovery["conversation_valid"], recovery)
+        self.assertFalse(recovery["delivery_valid"])
+        self.assertEqual(Path(native["session"]["file"]).read_bytes(), session_before)
+        self.assertEqual(coordinate.snapshot(self.root / "failed"), original_artifacts)
+        self.assertFalse((failed_remote / "invocations.txt").exists())
+        second = coordinate.run_task(self.task_path, self.profile_path, self.root / "second", self.root / "locks", previous_directory=self.root / "reconciled")
+        self.assertTrue(second["delivery_valid"], second)
+
+    def test_unacknowledged_unsettled_and_partial_saved_runs_cannot_continue(self):
+        for behavior in ("no-prompt-ack", "saved-no-settlement", "saved-partial-tail", "saved-wrong-id"):
+            with self.subTest(behavior=behavior):
+                self.profile["pi_argv"][-1] = behavior; dump(self.profile_path, self.profile)
+                task = self.assignment("attempted edit"); task["wall_seconds"] = 1; dump(self.task_path, task)
+                output = self.root / behavior
+                failed = coordinate.run_task(self.task_path, self.profile_path, output, self.root / "locks", save_session=True)
+                self.assertFalse(failed["delivery_valid"])
+                self.assertTrue(failed["cleanup_complete"])
+                remote = Path(failed["remote_artifacts"]).parent
+                self.assertFalse((remote / "results/verify.started.json").exists())
+                calls = (remote / "invocations.txt").read_bytes() if (remote / "invocations.txt").exists() else b""
+                recovery = coordinate.recover_task(output, self.profile_path, self.root / (behavior + "-recovery"), self.root / "locks")
+                self.assertFalse(recovery["conversation_valid"])
+                self.assertFalse(recovery["recovery_valid"])
+                self.assertEqual((remote / "invocations.txt").read_bytes() if (remote / "invocations.txt").exists() else b"", calls)
+                with self.assertRaises(ValueError):
+                    coordinate.run_task(self.task_path, self.profile_path, self.root / (behavior + "-continue"), self.root / "locks", previous_directory=self.root / (behavior + "-recovery"))
+
+    def test_unknown_saved_stop_refuses_continue_before_new_owner(self):
+        self.assignment("first edit")
+        with mock.patch.object(coordinate, "OpenShellOwner", self.factory("stop-error")):
+            first = coordinate.run_task(self.task_path, self.profile_path, self.root / "first", self.root / "locks", save_session=True)
+        self.assertFalse(first["cleanup_complete"])
+        self.assertTrue(first["artifacts_verified"])
+        self.assertFalse(first["delivery_valid"])
+        count = len(self.instances)
+        with self.assertRaisesRegex(ValueError, "stopped saved-session"):
+            coordinate.run_task(self.task_path, self.profile_path, self.root / "second", self.root / "locks", previous_directory=self.root / "first")
+        self.assertEqual(len(self.instances), count)
+
+    def test_checkpoint_failure_keeps_worker_nonzero_and_delivery_incomplete(self):
+        self.assignment("first edit")
+        execute = coordinate.execute_to_log
+        def failed_checkpoint(argv, cwd, log, timeout, **options):
+            if "worker" not in argv:
+                return execute(argv, cwd, log, timeout, **options)
+            Path(log).write_bytes(b"Synthetic checkpoint-write refusal\n")
+            with mock.patch.object(coordinate, "complete_saved_conversation", side_effect=OSError("Synthetic checkpoint-write refusal")):
+                return coordinate.worker(Path(argv[-1]))
+        with mock.patch.object(coordinate, "execute_to_log", failed_checkpoint):
+            first = coordinate.run_task(self.task_path, self.profile_path, self.root / "first", self.root / "locks", save_session=True)
+        self.assertFalse(first["delivery_valid"])
+        self.assertTrue(first["cleanup_complete"])
+        self.assertEqual(first["exec_exit_code"], 1)
+        remote = Path(first["remote_artifacts"]).parent
+        worker_receipt = coordinate.read_json(remote / "results/worker-receipt.json")
+        self.assertEqual(worker_receipt["outcome"], "incomplete")
+        self.assertTrue(worker_receipt["checks_passed"])
+        self.assertFalse((remote / "results/conversation.json").exists())
 
 
 if __name__ == "__main__":
