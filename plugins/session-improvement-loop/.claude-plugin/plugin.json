@@ -1,0 +1,18 @@
+{
+  "name": "session-improvement-loop",
+  "version": "0.2.1",
+  "description": "Research uncertain decisions and local inference candidates, and independently validate reusable workflow improvements.",
+  "author": {
+    "name": "Fakoli",
+    "url": "https://github.com/fakoli"
+  },
+  "homepage": "https://github.com/fakoli/agent-plugins",
+  "repository": "https://github.com/fakoli/agent-plugins",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "sessions",
+    "skills",
+    "productivity"
+  ]
+}

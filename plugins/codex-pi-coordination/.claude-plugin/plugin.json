@@ -1,0 +1,19 @@
+{
+  "name": "codex-pi-coordination",
+  "version": "0.3.0",
+  "description": "Coordinate bounded tasks, saved Pi conversations and model capability discovery inside NVIDIA OpenShell.",
+  "author": {
+    "name": "Fakoli",
+    "url": "https://github.com/fakoli"
+  },
+  "homepage": "https://github.com/fakoli/agent-plugins",
+  "repository": "https://github.com/fakoli/agent-plugins",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "pi",
+    "coordination",
+    "openshell",
+    "delegation"
+  ]
+}
