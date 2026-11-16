@@ -1,0 +1,50 @@
+{
+  "name": "fakoli-agent-plugins",
+  "owner": {
+    "name": "Fakoli",
+    "url": "https://github.com/fakoli"
+  },
+  "description": "Portable agent plugins and skills derived from repeated agent-workflow evidence.",
+  "plugins": [
+    {
+      "name": "session-improvement-loop",
+      "source": "./plugins/session-improvement-loop",
+      "description": "Research uncertain decisions and local inference candidates, and independently validate reusable workflow improvements."
+    },
+    {
+      "name": "host-operations",
+      "source": "./plugins/host-operations",
+      "description": "Diagnose GPU ownership and credential-loading boundaries without exposing secrets or making unreviewed host changes."
+    },
+    {
+      "name": "workflow-intake",
+      "source": "./plugins/workflow-intake",
+      "description": "Turn an external gist, README, issue, or runbook into a pinned comparison and safe local test plan."
+    },
+    {
+      "name": "workspace-coordination",
+      "source": "./plugins/workspace-coordination",
+      "description": "Coordinate changes across related repositories and worktrees while preserving dirty state and ownership boundaries."
+    },
+    {
+      "name": "feature-retro",
+      "source": "./plugins/feature-retro",
+      "description": "Prepare evidence-backed retrospective design reviews and article inputs after a feature build."
+    },
+    {
+      "name": "repo-graph",
+      "source": {
+        "source": "github",
+        "repo": "fakoli/repo-graph",
+        "ref": "v0.6.0",
+        "sha": "b21a7c19fc3f068d3b0227ba1fa6acd5eda17280"
+      },
+      "description": "Local repository diagrams and incremental search for large codebases."
+    },
+    {
+      "name": "codex-pi-coordination",
+      "source": "./plugins/codex-pi-coordination",
+      "description": "Coordinate bounded tasks, saved Pi conversations and model capability discovery inside NVIDIA OpenShell."
+    }
+  ]
+}

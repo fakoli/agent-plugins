@@ -1,0 +1,19 @@
+{
+  "name": "host-operations",
+  "version": "0.1.0",
+  "description": "Diagnose GPU ownership and credential-loading boundaries without exposing secrets or making unreviewed host changes.",
+  "author": {
+    "name": "Fakoli",
+    "url": "https://github.com/fakoli"
+  },
+  "homepage": "https://github.com/fakoli/agent-plugins",
+  "repository": "https://github.com/fakoli/agent-plugins",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "gpu",
+    "credentials",
+    "windows",
+    "operations"
+  ]
+}

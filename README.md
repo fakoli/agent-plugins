@@ -1,6 +1,6 @@
 # Fakoli Agent Plugins
 
-Public, portable Codex plugins and skills derived from repeated agent-workflow evidence.
+Public, portable Codex and Claude Code plugins and skills derived from repeated agent-workflow evidence.
 
 Every contribution must be useful without private environment context, use synthetic or sanitized examples, and pass the relevant skill and plugin validators. Raw sessions, personal paths, infrastructure topology, reachable endpoints, and credentials do not belong here.
 
@@ -29,6 +29,23 @@ codex plugin add session-improvement-loop@fakoli-agent-plugins
 
 Install any catalog entry with
 `codex plugin add <plugin-name>@fakoli-agent-plugins`.
+
+### Claude Code
+
+The same catalog is published for Claude Code in
+`.claude-plugin/marketplace.json`, and each local plugin carries a
+`.claude-plugin/plugin.json` beside its Codex manifest. Skills are shared.
+
+```bash
+claude plugin marketplace add fakoli/agent-plugins
+```
+
+```bash
+claude plugin install session-improvement-loop@fakoli-agent-plugins
+```
+
+Codex prompts invoke skills as `$skill-name`; Claude Code exposes them as
+`/plugin-name:skill-name` and also loads them from matching requests.
 
 `$repo-graph /path/to/repo` or `$repo-graph https://github.com/owner/repo`
 writes a self-contained interactive view, Mermaid source, and JSON under the

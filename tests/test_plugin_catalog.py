@@ -32,6 +32,26 @@ class PluginCatalogTests(unittest.TestCase):
             self.assertEqual(entry["policy"]["installation"], "AVAILABLE")
             self.assertTrue((plugin / "skills").is_dir())
 
+    def test_claude_marketplace_mirrors_codex_catalog(self) -> None:
+        codex = json.loads(MARKETPLACE.read_text(encoding="utf-8"))
+        claude = json.loads((ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(claude["name"], codex["name"])
+        self.assertEqual([p["name"] for p in claude["plugins"]], [p["name"] for p in codex["plugins"]])
+        for codex_entry, claude_entry in zip(codex["plugins"], claude["plugins"]):
+            source = codex_entry["source"]
+            if source["source"] == "url":
+                self.assertEqual(claude_entry["source"]["repo"], "fakoli/repo-graph")
+                self.assertEqual(claude_entry["source"]["ref"], source["ref"])
+                self.assertEqual(claude_entry["source"]["sha"], source["sha"])
+                continue
+            self.assertEqual(claude_entry["source"], source["path"])
+            plugin = ROOT / source["path"].removeprefix("./")
+            codex_manifest = json.loads((plugin / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+            claude_manifest = json.loads((plugin / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+            for field in ("name", "version", "description"):
+                self.assertEqual(claude_manifest[field], codex_manifest[field], plugin)
+
     def test_skills_have_complete_frontmatter_and_ui_prompts(self) -> None:
         catalog = json.loads(MARKETPLACE.read_text(encoding="utf-8"))
         plugin_names = {entry["name"] for entry in catalog["plugins"] if entry["source"]["source"] == "local"}
